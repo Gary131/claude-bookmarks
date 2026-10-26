@@ -12,6 +12,10 @@ function h(tag, cls, text) {
   return e;
 }
 
+async function getSettings() {
+  return (await chrome.storage.local.get('cbm_settings')).cbm_settings || {};
+}
+
 async function getAll() {
   const all = await chrome.storage.local.get(null);
   return Object.entries(all)
@@ -28,7 +32,7 @@ function fmtDate(ts) {
 
 async function render() {
   const q = norm($('#search').value).toLowerCase();
-  const convs = await getAll();
+  const [convs, settings] = await Promise.all([getAll(), getSettings()]);
   const list = $('#list');
   list.replaceChildren();
 
@@ -38,7 +42,8 @@ async function render() {
     const groups = conv.groups || [];
     const gname = new Map(groups.map((g) => [g.id, g.name || 'Untitled group']));
     const all = [...(conv.items || [])];
-    if (!conv.ordered) all.sort((a, b) => a.index - b.index);
+    // Same setting as the side panel's "Sort by position in conversation" checkbox
+    if (!conv.ordered || settings.sortByPosition) all.sort((a, b) => a.index - b.index || a.createdAt - b.createdAt);
     // Same order as the side panel: ungrouped first, then each group in order
     const ordered = [
       ...all.filter((b) => !gname.has(b.groupId)),

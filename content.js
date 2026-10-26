@@ -129,11 +129,19 @@
     const near = (arr) => arr.sort((a, b) => Math.abs(a.index - bm.index) - Math.abs(b.index - bm.index))[0];
     const same = msgs.filter((m) => m.role === bm.role);
     let c = same.filter((m) => fpOf(m) === bm.fp);
+    if (c.length && bm.quote) {
+      // identical messages: prefer the one that still contains the passage
+      const withQuote = c.filter((m) => quoteMatch(strip(m.el.textContent), bm));
+      if (withQuote.length) c = withQuote;
+    }
     if (c.length) return near(c);
     if (bm.quote) {
-      const q = strip(bm.quote);
-      c = msgs.filter((m) => strip(m.el.textContent).includes(q));
-      if (c.length) return near(c);
+      // message changed: pick the message whose passage context matches best, then the nearest one
+      const scored = msgs
+        .map((m) => ({ m, mt: quoteMatch(strip(m.el.textContent), bm) }))
+        .filter((x) => x.mt)
+        .sort((a, b) => b.mt.score - a.mt.score || Math.abs(a.m.index - bm.index) - Math.abs(b.m.index - bm.index));
+      if (scored.length) return scored[0].m;
     }
     const head = (bm.fp || '').slice(0, 60);
     if (head.length >= 20) {
@@ -143,23 +151,70 @@
     return null;
   }
 
-  // Find the Range of quoted text within a message (ignoring whitespace differences)
-  function findQuoteRange(root, quote) {
-    const target = strip(quote);
-    if (!target) return null;
+  // ===== Passage anchors =====
+  // A passage bookmark stores its text plus where it was: the offset in the message and up to
+  // CTX characters of text before and after it (all whitespace-free, so reflowed or re-rendered
+  // markup still matches). Short or repeated text then resolves to the occurrence that was selected.
+  const CTX = 32;
+
+  // Whitespace-free text of a message, with a map from each character back to its DOM text node
+  function textIndex(root) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     const map = [];
     let s = '';
     for (let n; (n = walker.nextNode());) {
-      const t = n.nodeValue;
-      for (let i = 0; i < t.length; i++) {
-        if (!/\s/.test(t[i])) { s += t[i]; map.push([n, i]); }
+      const v = n.nodeValue;
+      for (let i = 0; i < v.length; i++) {
+        if (!/\s/.test(v[i])) { s += v[i]; map.push([n, i]); }
       }
     }
-    const at = s.indexOf(target);
-    if (at < 0) return null;
-    const [sn, so] = map[at];
-    const [en, eo] = map[at + target.length - 1];
+    return { s, map };
+  }
+
+  // Context saved when a passage is bookmarked (range = the selection, inside msgEl)
+  function quoteAnchor(msgEl, range) {
+    const before = document.createRange();
+    before.setStart(msgEl, 0);
+    before.setEnd(range.startContainer, range.startOffset);
+    const after = document.createRange();
+    after.setStart(range.endContainer, range.endOffset);
+    after.setEnd(msgEl, msgEl.childNodes.length);
+    const pre = strip(before.toString());
+    const suf = strip(after.toString());
+    return { qOffset: pre.length, qLen: strip(range.toString()).length, qPrefix: pre.slice(-CTX), qSuffix: suf.slice(0, CTX) };
+  }
+
+  // Best occurrence of a passage in whitespace-free text s: the one whose surrounding text matches
+  // the saved context most, then the one closest to the saved offset. Bookmarks saved before
+  // anchors existed have no context or offset and fall back to the first occurrence.
+  function quoteMatch(s, bm) {
+    const q = strip(bm.quote);
+    if (!q) return null;
+    const len = bm.qLen || q.length;
+    let best = null;
+    for (let at = s.indexOf(q); at >= 0; at = s.indexOf(q, at + 1)) {
+      let score = 0;
+      const p = bm.qPrefix || '';
+      while (score < p.length && s[at - 1 - score] === p[p.length - 1 - score]) score++;
+      const x = bm.qSuffix || '';
+      const end = at + len;
+      let k = 0;
+      while (k < x.length && s[end + k] === x[k]) k++;
+      score += k;
+      const dist = Math.abs(at - (bm.qOffset ?? 0));
+      if (!best || score > best.score || (score === best.score && dist < best.dist)) best = { at, score, dist };
+    }
+    // long passages store only their first 500 characters; qLen covers the full selection
+    return best && { ...best, len: Math.min(len, s.length - best.at) };
+  }
+
+  // DOM Range of a passage bookmark within its message
+  function findQuoteRange(root, bm) {
+    const { s, map } = textIndex(root);
+    const mt = quoteMatch(s, bm);
+    if (!mt) return null;
+    const [sn, so] = map[mt.at];
+    const [en, eo] = map[mt.at + mt.len - 1];
     const r = document.createRange();
     r.setStart(sn, so);
     r.setEnd(en, eo + 1);
@@ -176,7 +231,7 @@
   const scrollerTop = (sc) => (sc === document.scrollingElement || sc === document.documentElement ? 0 : sc.getBoundingClientRect().top);
 
   function anchorOf(bm, m) {
-    const range = bm.quote ? findQuoteRange(m.el, bm.quote) : null;
+    const range = bm.quote ? findQuoteRange(m.el, bm) : null;
     return { range, top: (range || m.el).getBoundingClientRect().top };
   }
 
@@ -217,18 +272,18 @@
   }
 
   // ===== Add / remove =====
-  async function addBookmark(m, quote = '') {
+  async function addBookmark(m, passage = null) {
     if (!state.convId) { toast('Open a conversation first'); return; }
     const fp = fingerprint(m.el);
-    quote = norm(quote).slice(0, 500);
-    if (!quote && state.items.some((b) => !b.quote && b.role === m.role && b.fp === fp)) {
-      toast('This message is already bookmarked');
-      return;
-    }
+    const dup = state.items.some((b) => b.role === m.role && b.fp === fp && (passage
+      ? b.quote && b.qOffset === passage.qOffset && b.qLen === passage.qLen
+      : !b.quote));
+    if (dup) { toast(passage ? 'This passage is already bookmarked' : 'This message is already bookmarked'); return; }
     const bm = {
-      id: uid(), role: m.role, index: m.index, fp, quote,
-      snippet: (quote || norm(m.el.textContent)).slice(0, 160),
+      id: uid(), role: m.role, index: m.index, fp, quote: '',
+      snippet: norm(m.el.textContent).slice(0, 160),
       note: '', groupId: null, createdAt: Date.now(),
+      ...passage,
     };
     state.items.push(bm);
     await save();
@@ -272,17 +327,36 @@
     await save();
   }
 
-  // Sort bookmarks inside each group by where they appear in the conversation
-  async function sortByPosition() {
-    const msgs = getMessages();
-    const pos = new Map(state.items.map((b) => {
-      const m = locate(b, msgs);
-      return [b.id, m ? m.index : b.index];
-    }));
-    state.items.sort((a, b) => pos.get(a.id) - pos.get(b.id) || a.createdAt - b.createdAt);
-    await save();
-    render();
-    toast('Sorted by position in the conversation');
+  // ===== View settings (shared by all conversations) =====
+  // sortByPosition: show bookmarks in conversation order instead of the custom (dragged) order.
+  // It only changes how lists are displayed; the custom order is kept and comes back when unchecked.
+  const SETTINGS_KEY = 'cbm_settings';
+  const settings = { sortByPosition: false };
+
+  async function loadSettings() {
+    if (!alive()) return;
+    Object.assign(settings, (await chrome.storage.local.get(SETTINGS_KEY))[SETTINGS_KEY]);
+  }
+
+  async function setSetting(key, value) {
+    settings[key] = value;
+    await chrome.storage.local.set({ [SETTINGS_KEY]: { ...settings } });
+  }
+
+  // Where a bookmark sits in the conversation: [message index, offset of the quote in that message]
+  // (whole-message bookmarks come before passages from the same message)
+  function positionKey(bm, msgs) {
+    const m = locate(bm, msgs);
+    let offset = -1;
+    if (bm.quote && m) offset = quoteMatch(strip(m.el.textContent), bm)?.at ?? 0;
+    return [m ? m.index : bm.index, offset];
+  }
+  const comparePos = (ka, kb) => ka[0] - kb[0] || ka[1] - kb[1];
+
+  // Items as they should be displayed under the current setting
+  function inView(items, keys) {
+    if (!settings.sortByPosition) return items;
+    return [...items].sort((a, b) => comparePos(keys.get(a.id), keys.get(b.id)) || a.createdAt - b.createdAt);
   }
 
   // Move a bookmark into a group (null = ungrouped), before another bookmark (null = at the end)
@@ -389,7 +463,7 @@
     setTimeout(() => {
       const sel = getSelection();
       const text = sel && !sel.isCollapsed ? sel.toString() : '';
-      if (strip(text).length < 2) { selBtn.classList.remove('show'); return; }
+      if (!strip(text)) { selBtn.classList.remove('show'); return; }
       const range = sel.getRangeAt(0);
       const msg = topMessage(range.commonAncestorContainer);
       if (!msg) { selBtn.classList.remove('show'); return; }
@@ -398,6 +472,7 @@
       selBtn.style.left = `${Math.min(Math.max(r.left, 8), window.innerWidth - 120)}px`;
       selBtn._msg = msg;
       selBtn._text = text;
+      selBtn._range = range.cloneRange();
       selBtn.classList.add('show');
     }, 10);
   });
@@ -405,7 +480,15 @@
   selBtn.addEventListener('click', async () => {
     selBtn.classList.remove('show');
     const m = getMessages().find((x) => x.el === selBtn._msg);
-    if (m) await addBookmark(m, selBtn._text);
+    const range = selBtn._range;
+    if (m && range && m.el.contains(range.commonAncestorContainer)) {
+      // quote = DOM text (what matching runs against); snippet = the text as the user saw it
+      await addBookmark(m, {
+        quote: norm(range.toString()).slice(0, 500),
+        snippet: norm(selBtn._text).slice(0, 160),
+        ...quoteAnchor(m.el, range),
+      });
+    }
     getSelection()?.removeAllRanges();
   });
   document.addEventListener('mousedown', (e) => { if (e.target !== selBtn) selBtn.classList.remove('show'); });
@@ -476,11 +559,13 @@
     return box;
   }
 
+  let viewKeys = new Map();
   function render() {
     updateTab();
     if (!panel.classList.contains('open') || drag.active) return;
     const msgs = getMessages();
     const missing = new Set(state.items.filter((b) => !locate(b, msgs)).map((b) => b.id));
+    viewKeys = new Map(state.items.map((b) => [b.id, positionKey(b, msgs)]));
     const listScroll = panel.querySelector('.cbm-list')?.scrollTop || 0;
 
     panel.replaceChildren();
@@ -488,23 +573,33 @@
     head.append(h('span', 'cbm-title', `🔖 Bookmarks (${state.items.length})`));
     const tools = h('div', 'cbm-tools');
     tools.append(iconBtn('＋ Group', 'New group', addGroup));
-    tools.append(iconBtn('⇅', 'Sort each group by position in the conversation', sortByPosition));
     tools.append(iconBtn('✕', 'Close (Alt+B)', () => setPanel(false)));
     head.append(tools);
     panel.append(head);
+
+    if (state.items.length) {
+      const bar = h('label', 'cbm-bar');
+      bar.title = 'Checked: conversation order. Unchecked: your own order (drag to arrange).';
+      const cb = h('input');
+      cb.type = 'checkbox';
+      cb.checked = settings.sortByPosition;
+      cb.onchange = async () => { await setSetting('sortByPosition', cb.checked); render(); };
+      bar.append(cb, h('span', null, 'Sort by position in conversation'));
+      panel.append(bar);
+    }
 
     const list = h('div', 'cbm-list');
     if (!state.items.length && !state.groups.length) {
       list.append(h('div', 'cbm-empty', 'Hover over a message and click 🔖, or select some text and click “Bookmark selection”.'));
     } else {
       // Ungrouped bookmarks always come first
-      const loose = state.items.filter((b) => !b.groupId);
+      const loose = inView(state.items.filter((b) => !b.groupId), viewKeys);
       const ungrouped = h('section', 'cbm-section cbm-ungrouped' + (loose.length ? '' : ' empty'));
       ungrouped.append(renderItems(loose, missing, null));
       list.append(ungrouped);
 
       for (const g of state.groups) {
-        const items = state.items.filter((b) => b.groupId === g.id);
+        const items = inView(state.items.filter((b) => b.groupId === g.id), viewKeys);
         const sec = h('section', 'cbm-section cbm-group' + (g.collapsed ? ' collapsed' : ''));
         sec.dataset.gid = g.id;
         const gh = h('div', 'cbm-group-head');
@@ -524,7 +619,9 @@
     }
     panel.append(list);
     list.scrollTop = listScroll;
-    panel.append(h('div', 'cbm-foot', 'Drag to reorder · Alt+B toggle panel · Alt+↑/↓ previous/next'));
+    panel.append(h('div', 'cbm-foot', (settings.sortByPosition
+      ? 'Sorted by position · drag to move between groups'
+      : 'Drag to reorder') + ' · Alt+B toggle panel · Alt+↑/↓ previous/next'));
   }
 
   // ===== Drag and drop =====
@@ -646,8 +743,8 @@
     // the pointer to travel a bit before deciding again, and never move while over the placeholder.
     if (drag.lockY != null && Math.abs(y - drag.lockY) < LOCK_PX) return;
     drag.lockY = null;
-    const own = R(drag.el);
-    if (!drag.into && own && y >= own.top && y < own.bottom) return;
+    const slot = R(drag.el);
+    if (!drag.into && slot && y >= slot.top && y < slot.bottom) return;
 
     if (drag.kind === 'group') {
       const groups = [...drag.list.querySelectorAll('.cbm-group')].filter((g) => g !== drag.el && R(g));
@@ -666,7 +763,10 @@
     if (!box) { setInto(sec); return; } // collapsed group: drop at its end
     setInto(null);
     const items = [...box.querySelectorAll('.cbm-item')].filter((i) => i !== drag.el && R(i));
-    const before = items.find((i) => y < mid(i)) || null;
+    const own = viewKeys.get(drag.id);
+    const before = (settings.sortByPosition
+      ? items.find((i) => comparePos(viewKeys.get(i.dataset.id), own) > 0)
+      : items.find((i) => y < mid(i))) || null;
     if (drag.el.parentElement === box && (drag.el.nextElementSibling === before ||
         (!before && !drag.el.nextElementSibling?.classList.contains('cbm-item')))) return;
     flip(() => box.insertBefore(drag.el, before || box.querySelector('.cbm-drop-hint')));
@@ -699,8 +799,11 @@
     if (commit && kind === 'item') {
       if (into) target = { group: into.dataset.gid, before: null };
       else {
+        const group = el.closest('.cbm-section')?.dataset.gid || null;
         const next = el.nextElementSibling?.classList.contains('cbm-item') ? el.nextElementSibling : null;
-        target = { group: el.closest('.cbm-section')?.dataset.gid || null, before: next ? next.dataset.id : null };
+        if (!settings.sortByPosition) target = { group, before: next ? next.dataset.id : null };
+        // Sorted view: only a group change is a real move; keep the custom order otherwise
+        else if (group !== (state.items.find((b) => b.id === id)?.groupId || null)) target = { group, before: null };
       }
     } else if (commit) {
       target = { before: el.nextElementSibling?.dataset.gid || null };
@@ -741,7 +844,7 @@
       if (!m) { missing.add(bm.id); continue; }
       marked.add(m.el);
       if (bm.quote && HL) {
-        const r = findQuoteRange(m.el, bm.quote);
+        const r = findQuoteRange(m.el, bm);
         if (r) ranges.push(r);
       }
     }
@@ -789,10 +892,14 @@
       tryPending();
     }
     if (changes[PENDING_KEY]?.newValue) tryPending();
+    if (changes[SETTINGS_KEY]) {
+      Object.assign(settings, changes[SETTINGS_KEY].newValue);
+      if (!panel.contains(document.activeElement)) render();
+    }
   });
 
   async function onNavigate() {
-    await load();
+    await Promise.all([load(), loadSettings()]);
     refreshMarks();
     render();
     tryPending();

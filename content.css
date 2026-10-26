@@ -88,6 +88,9 @@ html.dark .cbm-ui, html[data-mode="dark"] .cbm-ui, html[data-theme="dark"] .cbm-
 
 /* Header tools */
 .cbm-tools { display: flex; align-items: center; gap: 2px; }
+.cbm-bar { display: flex; align-items: center; gap: 6px; padding: 6px 12px; border-bottom: 1px solid var(--cbm-border); color: var(--cbm-muted); font-size: 12px; cursor: pointer; user-select: none; }
+.cbm-bar:hover { color: var(--cbm-fg); }
+.cbm-bar input { margin: 0; accent-color: var(--cbm-accent); cursor: pointer; }
 
 /* Groups */
 .cbm-list { position: relative; }
