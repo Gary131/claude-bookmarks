@@ -452,8 +452,6 @@
     item.dataset.id = bm.id;
     const top = h('div', 'cbm-row');
     const grip = h('span', 'cbm-grip', '⠿');
-    grip.title = 'Drag to reorder or move to a group';
-    grip.dataset.drag = 'item';
     top.append(grip);
     top.append(h('span', `cbm-role ${bm.role}`, bm.role === 'user' ? 'You' : 'Claude'));
     top.append(textInput('cbm-note', bm.note, 'Add a note…', async (v) => {
@@ -464,7 +462,7 @@
     item.append(top);
     item.append(h('div', 'cbm-snippet' + (bm.quote ? ' quote' : ''), bm.quote ? `“${bm.snippet}”` : bm.snippet));
     item.onclick = (e) => {
-      if (drag.justDropped || isEditable(e.target) || e.target.closest('button, .cbm-grip')) return;
+      if (drag.justDropped || isEditable(e.target) || e.target.closest('button')) return;
       jump(bm);
     };
     return item;
@@ -511,8 +509,6 @@
         sec.dataset.gid = g.id;
         const gh = h('div', 'cbm-group-head');
         const grip = h('span', 'cbm-grip', '⠿');
-        grip.title = 'Drag to reorder groups';
-        grip.dataset.drag = 'group';
         gh.append(grip);
         gh.append(iconBtn(g.collapsed ? '▸' : '▾', g.collapsed ? 'Expand' : 'Collapse', async () => {
           await updateGroup(g.id, { collapsed: !g.collapsed });
@@ -528,109 +524,211 @@
     }
     panel.append(list);
     list.scrollTop = listScroll;
-    panel.append(h('div', 'cbm-foot', 'Drag ⠿ to reorder · Alt+B toggle panel · Alt+↑/↓ previous/next'));
+    panel.append(h('div', 'cbm-foot', 'Drag to reorder · Alt+B toggle panel · Alt+↑/↓ previous/next'));
   }
 
-  // ===== Drag and drop (pointer-based, so claude.ai's file-drop handling is never triggered) =====
+  // ===== Drag and drop =====
+  // Pointer-based (so claude.ai's file-drop overlay is never triggered). The dragged row floats
+  // under the pointer as a "ghost", its original element stays in the list as a placeholder, and
+  // the placeholder moves through the DOM while the other rows slide out of the way (FLIP animation).
   const drag = { active: false, pending: null, justDropped: false };
-  const dropLine = h('div', 'cbm-drop-line');
+  const ANIM_MS = 170;
+  const LOCK_PX = 14;
+  const REDUCED_MOTION = matchMedia('(prefers-reduced-motion: reduce)');
 
+  // Drag starts anywhere on a bookmark or group header, except text fields and buttons
   panel.addEventListener('pointerdown', (e) => {
-    const grip = e.target.closest('.cbm-grip');
-    if (!grip || e.button !== 0) return;
-    e.preventDefault();
-    const kind = grip.dataset.drag;
-    const el = grip.closest(kind === 'item' ? '.cbm-item' : '.cbm-group');
+    if (e.button !== 0 || drag.active || e.target.closest('input, textarea, button')) return;
+    const item = e.target.closest('.cbm-item');
+    const head = !item && e.target.closest('.cbm-group-head');
+    if (!item && !head) return;
+    e.preventDefault(); // no text selection while dragging
+    if (document.activeElement && panel.contains(document.activeElement)) document.activeElement.blur();
+    const kind = item ? 'item' : 'group';
+    const el = item || head.closest('.cbm-group');
     drag.pending = { kind, el, id: kind === 'item' ? el.dataset.id : el.dataset.gid, x: e.clientX, y: e.clientY };
   });
 
   document.addEventListener('pointermove', (e) => {
-    if (!drag.pending && !drag.active) return;
+    if (drag.dropping || (!drag.pending && !drag.active)) return;
     if (!drag.active) {
-      if (Math.hypot(e.clientX - drag.pending.x, e.clientY - drag.pending.y) < 4) return;
-      Object.assign(drag, drag.pending, { active: true, pending: null, target: null });
-      drag.el.classList.add('cbm-dragging');
-      panel.classList.add('cbm-drag-' + drag.kind);
-      panel.querySelector('.cbm-list').append(dropLine);
-      getSelection()?.removeAllRanges();
+      if (Math.hypot(e.clientX - drag.pending.x, e.clientY - drag.pending.y) < 5) return;
+      startDrag(drag.pending);
     }
     e.preventDefault();
     drag.y = e.clientY;
-    updateDropTarget(e.clientX, e.clientY);
+    moveGhost();
+    updatePlaceholder();
     autoScroll();
   });
 
-  function endDrag(commit) {
-    if (drag.pending) { drag.pending = null; return; }
-    if (!drag.active) return;
-    const { kind, id, target, el } = drag;
-    drag.active = false;
-    el.classList.remove('cbm-dragging');
-    panel.classList.remove('cbm-drag-item', 'cbm-drag-group');
-    dropLine.remove();
-    panel.querySelectorAll('.cbm-drop-into').forEach((x) => x.classList.remove('cbm-drop-into'));
-    drag.justDropped = true;
-    setTimeout(() => { drag.justDropped = false; }, 0);
-    if (!commit || !target) { render(); return; }
-    if (kind === 'item') moveItem(id, target.group, target.before);
-    else moveGroup(id, target.before);
-  }
-  document.addEventListener('pointerup', () => endDrag(true));
-  document.addEventListener('pointercancel', () => endDrag(false));
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && drag.active) endDrag(false); }, true);
-
-  // Pick the insertion point for the pointer position and draw the indicator line
-  function updateDropTarget(x, y) {
+  function startDrag(p) {
     const list = panel.querySelector('.cbm-list');
-    panel.querySelectorAll('.cbm-drop-into').forEach((el) => el.classList.remove('cbm-drop-into'));
-    let line = null;
+    const r = p.el.getBoundingClientRect();
+    Object.assign(drag, p, { active: true, pending: null, list, into: null, lockY: null, offsetY: p.y - r.top });
+    // Ghost: a copy of the row that follows the pointer
+    const ghost = h('div', 'cbm-ui cbm-ghost');
+    const clone = p.el.cloneNode(true);
+    const srcInputs = p.el.querySelectorAll('input');
+    clone.querySelectorAll('input').forEach((inp, i) => { inp.value = srcInputs[i]?.value || ''; });
+    ghost.append(clone);
+    Object.assign(ghost.style, { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px` });
+    document.body.append(ghost);
+    drag.ghost = ghost;
+    p.el.classList.add('cbm-placeholder');
+    panel.classList.add('cbm-drag-' + p.kind);
+    getSelection()?.removeAllRanges();
+    measure();
+  }
+
+  function moveGhost() {
+    const lr = drag.list.getBoundingClientRect();
+    const h0 = drag.ghost.offsetHeight;
+    // keep the ghost roughly inside the list area
+    const top = Math.min(Math.max(drag.y - drag.offsetY, lr.top - h0 / 2), lr.bottom - h0 / 2);
+    drag.ghost.style.top = `${top}px`;
+  }
+
+  // Elements that take part in the reorder animation
+  const animated = () => [...drag.list.querySelectorAll('.cbm-section, .cbm-item, .cbm-drop-hint')];
+
+  // Layout position inside the list (offsetTop ignores in-flight transforms, so hit-testing
+  // doesn't jitter while rows are still animating). The list is the offsetParent of every row.
+  const layoutTop = (el) => {
+    let y = 0;
+    for (let e = el; e && e !== drag.list; e = e.offsetParent) y += e.offsetTop;
+    return y;
+  };
+  function measure() {
+    drag.rects = new Map(animated().map((el) => {
+      const top = layoutTop(el);
+      return [el, { top, bottom: top + el.offsetHeight }];
+    }));
+  }
+
+  // Move the placeholder in the DOM and animate everything that shifted (First-Last-Invert-Play)
+  function flip(mutate) {
+    const els = animated();
+    const toLayout = drag.list.getBoundingClientRect().top - drag.list.scrollTop;
+    const first = new Map(els.map((el) => [el, el.getBoundingClientRect().top])); // where it is on screen now
+    mutate();
+    const delta = new Map(els.map((el) => [el, first.get(el) - (toLayout + layoutTop(el))]));
+    for (const el of els) {
+      if (el === drag.el || drag.el.contains(el)) continue;
+      // a row inside a section that also moved only needs the difference
+      const parent = el.parentElement.closest('.cbm-section');
+      const dy = delta.get(el) - (parent && parent !== drag.el ? delta.get(parent) || 0 : 0);
+      if (Math.abs(dy) < 1 || REDUCED_MOTION.matches) continue;
+      el.style.transition = 'none';
+      el.style.transform = `translateY(${dy}px)`;
+      el.getBoundingClientRect(); // commit the inverted position before animating back
+      el.style.transition = `transform ${ANIM_MS}ms cubic-bezier(.2,.7,.3,1)`;
+      el.style.transform = '';
+    }
+    measure();
+    drag.lockY = drag.y - drag.list.getBoundingClientRect().top + drag.list.scrollTop;
+  }
+
+  function setInto(sec) {
+    if (drag.into === sec) return;
+    drag.into?.classList.remove('cbm-drop-into');
+    drag.into = sec;
+    sec?.classList.add('cbm-drop-into');
+    drag.el.classList.toggle('cbm-placeholder-away', !!sec);
+  }
+
+  // Decide where the placeholder belongs for the current pointer position
+  function updatePlaceholder() {
+    const y = drag.y - drag.list.getBoundingClientRect().top + drag.list.scrollTop;
+    const R = (el) => drag.rects.get(el);
+    const mid = (el) => (R(el).top + R(el).bottom) / 2;
+    // Hysteresis: right after the placeholder moves, the layout under the pointer shifts; wait for
+    // the pointer to travel a bit before deciding again, and never move while over the placeholder.
+    if (drag.lockY != null && Math.abs(y - drag.lockY) < LOCK_PX) return;
+    drag.lockY = null;
+    const own = R(drag.el);
+    if (!drag.into && own && y >= own.top && y < own.bottom) return;
 
     if (drag.kind === 'group') {
-      const secs = [...list.querySelectorAll('.cbm-group')].filter((s) => s !== drag.el);
-      const before = secs.find((s) => { const r = s.getBoundingClientRect(); return y < r.top + r.height / 2; });
-      drag.target = { before: before ? before.dataset.gid : null };
-      const ref = before || secs[secs.length - 1];
-      if (ref) line = before ? ref.getBoundingClientRect().top : ref.getBoundingClientRect().bottom;
-    } else {
-      const sections = [...list.querySelectorAll('.cbm-section')];
-      // The section under the pointer; above/below everything snaps to the first/last section
-      let sec = sections.find((s) => { const r = s.getBoundingClientRect(); return y >= r.top && y < r.bottom; });
-      if (!sec) sec = y < list.getBoundingClientRect().top + 40 ? sections[0] : sections[sections.length - 1];
-      if (!sec) return;
-      const gid = sec.dataset.gid || null;
-      const box = sec.querySelector('.cbm-items');
-      if (!box) {
-        // Collapsed group: drop at its end
-        drag.target = { group: gid, before: null };
-        sec.classList.add('cbm-drop-into');
-      } else {
-        const items = [...box.querySelectorAll('.cbm-item')].filter((i) => i !== drag.el);
-        const before = items.find((i) => { const r = i.getBoundingClientRect(); return y < r.top + r.height / 2; });
-        drag.target = { group: gid, before: before ? before.dataset.id : null };
-        if (before) line = before.getBoundingClientRect().top;
-        else if (items.length) line = items[items.length - 1].getBoundingClientRect().bottom;
-        else { sec.classList.add('cbm-drop-into'); }
-      }
+      const groups = [...drag.list.querySelectorAll('.cbm-group')].filter((g) => g !== drag.el && R(g));
+      const before = groups.find((g) => y < mid(g)) || null;
+      if (drag.el.nextElementSibling === before || (!before && !drag.el.nextElementSibling)) return;
+      flip(() => drag.list.insertBefore(drag.el, before));
+      return;
     }
 
-    if (line == null) { dropLine.style.display = 'none'; return; }
-    const lr = list.getBoundingClientRect();
-    dropLine.style.display = 'block';
-    dropLine.style.top = `${line - lr.top + list.scrollTop - 1}px`;
+    // Item: find the section under the pointer (nearest one when between sections)
+    const sections = [...drag.list.querySelectorAll('.cbm-section')].filter((s) => R(s));
+    if (!sections.length) return;
+    let sec = sections.find((s) => y >= R(s).top && y < R(s).bottom);
+    if (!sec) sec = sections.reduce((a, s) => (Math.min(Math.abs(y - R(s).top), Math.abs(y - R(s).bottom)) < Math.min(Math.abs(y - R(a).top), Math.abs(y - R(a).bottom)) ? s : a));
+    const box = sec.querySelector('.cbm-items');
+    if (!box) { setInto(sec); return; } // collapsed group: drop at its end
+    setInto(null);
+    const items = [...box.querySelectorAll('.cbm-item')].filter((i) => i !== drag.el && R(i));
+    const before = items.find((i) => y < mid(i)) || null;
+    if (drag.el.parentElement === box && (drag.el.nextElementSibling === before ||
+        (!before && !drag.el.nextElementSibling?.classList.contains('cbm-item')))) return;
+    flip(() => box.insertBefore(drag.el, before || box.querySelector('.cbm-drop-hint')));
   }
 
   // Scroll the list while dragging near its top or bottom edge
   function autoScroll() {
+    cancelAnimationFrame(autoScroll.raf);
     if (!drag.active) return;
-    const list = panel.querySelector('.cbm-list');
-    const r = list.getBoundingClientRect();
-    const zone = 36;
+    const r = drag.list.getBoundingClientRect();
+    const zone = 40;
     const dy = drag.y < r.top + zone ? -(r.top + zone - drag.y) : drag.y > r.bottom - zone ? drag.y - (r.bottom - zone) : 0;
     if (!dy) return;
-    list.scrollTop += dy / 3;
-    cancelAnimationFrame(autoScroll.raf);
-    autoScroll.raf = requestAnimationFrame(() => { updateDropTarget(0, drag.y); autoScroll(); });
+    const before = drag.list.scrollTop;
+    drag.list.scrollTop += dy / 3;
+    if (drag.list.scrollTop === before) return;
+    autoScroll.raf = requestAnimationFrame(() => { updatePlaceholder(); autoScroll(); });
   }
+
+  function endDrag(commit) {
+    if (drag.pending) { drag.pending = null; return; }
+    if (!drag.active || drag.dropping) return;
+    drag.dropping = true;
+    cancelAnimationFrame(autoScroll.raf);
+    const { kind, id, el, ghost, into } = drag;
+    drag.justDropped = true;
+    setTimeout(() => { drag.justDropped = false; }, 0);
+
+    let target = null;
+    if (commit && kind === 'item') {
+      if (into) target = { group: into.dataset.gid, before: null };
+      else {
+        const next = el.nextElementSibling?.classList.contains('cbm-item') ? el.nextElementSibling : null;
+        target = { group: el.closest('.cbm-section')?.dataset.gid || null, before: next ? next.dataset.id : null };
+      }
+    } else if (commit) {
+      target = { before: el.nextElementSibling?.dataset.gid || null };
+    }
+
+    const finish = () => {
+      ghost.remove();
+      drag.active = false;
+      drag.dropping = false;
+      panel.classList.remove('cbm-drag-item', 'cbm-drag-group');
+      into?.classList.remove('cbm-drop-into');
+      if (!target) { render(); return; }
+      if (kind === 'item') moveItem(id, target.group, target.before);
+      else moveGroup(id, target.before);
+    };
+    if (!commit) { finish(); return; }
+    // Let the ghost settle into its destination, then rebuild the panel from the saved state
+    const dest = (into || el).getBoundingClientRect();
+    ghost.classList.add('cbm-ghost-drop');
+    Object.assign(ghost.style, { top: `${dest.top}px`, opacity: into ? '0' : '' });
+    setTimeout(finish, ANIM_MS);
+  }
+  document.addEventListener('pointerup', () => endDrag(true));
+  document.addEventListener('pointercancel', () => endDrag(false));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && drag.active) { e.preventDefault(); e.stopPropagation(); endDrag(false); }
+  }, true);
+  window.addEventListener('blur', () => endDrag(false));
 
   // ===== Mark bookmarked messages and passages =====
   function refreshMarks() {

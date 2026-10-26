@@ -112,13 +112,28 @@ html.dark .cbm-ui, html[data-mode="dark"] .cbm-ui, html[data-theme="dark"] .cbm-
 .cbm-drag-item .cbm-drop-hint { display: block; }
 
 /* Drag and drop */
-.cbm-grip { flex: none; width: 12px; color: var(--cbm-muted); cursor: grab; user-select: none; touch-action: none; opacity: 0.45; font-size: 12px; line-height: 1; text-align: center; }
-.cbm-item:hover .cbm-grip, .cbm-group-head:hover .cbm-grip { opacity: 1; }
-.cbm-drag-item, .cbm-drag-group, .cbm-drag-item *, .cbm-drag-group * { cursor: grabbing !important; user-select: none; }
-.cbm-dragging { opacity: 0.4; }
+.cbm-grip { flex: none; width: 12px; color: var(--cbm-muted); user-select: none; opacity: 0.35; font-size: 12px; line-height: 1; text-align: center; }
+.cbm-item:hover .cbm-grip, .cbm-group-head:hover .cbm-grip { opacity: 0.9; }
+.cbm-item, .cbm-group-head { user-select: none; }
+.cbm-group-head { cursor: grab; }
+.cbm-drag-item, .cbm-drag-group, .cbm-drag-item *, .cbm-drag-group * { cursor: grabbing !important; }
 .cbm-drag-item .cbm-item:hover, .cbm-drag-group .cbm-item:hover { background: transparent; }
+.cbm-items:has(.cbm-item) .cbm-drop-hint { display: none !important; }
+/* the dragged row's slot in the list */
+.cbm-placeholder { background: var(--cbm-hover) !important; outline: 1.5px dashed var(--cbm-border); outline-offset: -1.5px; border-radius: 8px; }
+.cbm-placeholder > * { visibility: hidden; }
+.cbm-placeholder-away { opacity: 0.35; }
 .cbm-drop-into { outline: 2px solid var(--cbm-accent); outline-offset: -2px; }
-.cbm-drop-line { position: absolute; left: 6px; right: 6px; height: 2px; border-radius: 1px; background: var(--cbm-accent); pointer-events: none; display: none; }
+/* the copy that follows the pointer */
+.cbm-ghost {
+  position: fixed; z-index: 2147483003; pointer-events: none;
+  background: var(--cbm-bg); color: var(--cbm-fg); border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.22), 0 0 0 1px var(--cbm-accent);
+  transform: scale(1.02); font-size: 13px; max-height: 60vh; overflow: hidden;
+}
+.cbm-ghost .cbm-item, .cbm-ghost .cbm-group { background: var(--cbm-bg); margin: 0; }
+.cbm-ghost-drop { transition: top 170ms cubic-bezier(.2,.7,.3,1), transform 170ms, box-shadow 170ms, opacity 170ms; transform: scale(1); box-shadow: 0 0 0 1px var(--cbm-border); }
+@media (prefers-reduced-motion: reduce) { .cbm-ghost-drop { transition: none; } }
 .cbm-foot { padding: 8px 12px; border-top: 1px solid var(--cbm-border); color: var(--cbm-muted); font-size: 11px; }
 
 /* Toast */
