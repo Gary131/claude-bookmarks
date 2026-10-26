@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Claude Conversation Bookmarks</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="top">
+      <h1>🔖 Claude Conversation Bookmarks</h1>
+      <div class="actions">
+        <button id="export" title="Export all bookmarks as JSON">Export</button>
+        <button id="import" title="Import from JSON (merge)">Import</button>
+        <input id="file" type="file" accept="application/json,.json" hidden>
+      </div>
+    </div>
+    <input id="search" type="search" placeholder="Search notes, content, or conversation titles…" autofocus>
+  </header>
+  <main id="list"></main>
+  <script src="popup.js"></script>
+</body>
+</html>
