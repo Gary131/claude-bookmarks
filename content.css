@@ -69,6 +69,7 @@ html.dark .cbm-ui, html[data-mode="dark"] .cbm-ui, html[data-theme="dark"] .cbm-
 .cbm-item { padding: 8px; border-radius: 8px; cursor: pointer; }
 .cbm-item:hover { background: var(--cbm-hover); }
 .cbm-item.cbm-missing { opacity: 0.45; }
+.cbm-item.cbm-unloaded .cbm-snippet { opacity: 0.75; }
 .cbm-row { display: flex; align-items: center; gap: 6px; }
 .cbm-role { flex: none; font-size: 11px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--cbm-border); color: var(--cbm-muted); }
 .cbm-role.assistant { color: var(--cbm-accent); border-color: var(--cbm-accent); }

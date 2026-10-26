@@ -73,7 +73,10 @@
     const top = nodes
       .filter((n) => { for (let p = n.parentElement; p; p = p.parentElement) if (set.has(p)) return false; return true; })
       .sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
-    msgCache = top.map((el, index) => ({ el, index, role: userSet.has(el) ? 'user' : 'assistant' }));
+    const msgs = top.map((el, index) => ({ el, index, role: userSet.has(el) ? 'user' : 'assistant' }));
+    const base = msgs.length ? alignWindow(msgs.map((m) => keyOf(m.role, fpOf(m))), contentY(msgs[0].el)) : null;
+    for (const m of msgs) m.abs = base == null ? null : base + m.index;
+    msgCache = msgs;
     return msgCache;
   }
 
@@ -85,15 +88,115 @@
   }
   const fpOf = (m) => (m.fp ??= fingerprint(m.el));
 
+  // ===== Conversation order =====
+  // claude.ai keeps only part of a long conversation in the page (messages load as you scroll), so a
+  // message's index among the loaded ones isn't its position in the conversation. Every loaded window
+  // of messages is merged into what has been seen so far (state.seq, saved with the bookmarks):
+  // windows that share messages are aligned into one segment; a window that shares nothing (after a
+  // jump or a scrollbar drag) becomes its own segment, ordered by its vertical position in the page.
+  // Segments that later turn out to touch are merged. Flattened, the segments give every message an
+  // absolute position (m.abs) whose order matches the conversation.
+  const hash = (s) => {
+    let x = 2166136261;
+    for (let i = 0; i < s.length; i++) { x ^= s.charCodeAt(i); x = Math.imul(x, 16777619); }
+    return (x >>> 0).toString(36);
+  };
+  const keyOf = (role, fp) => (role === 'user' ? 'u' : 'a') + hash(fp || '');
+  let seqSaveT = null;
+
+  // Best alignment of keys against a segment: { off, votes } (off = segment index of keys[0])
+  function bestOffset(segKeys, keys, hint = 0) {
+    const at = new Map();
+    segKeys.forEach((k, j) => { if (!at.has(k)) at.set(k, []); at.get(k).push(j); });
+    const votes = new Map();
+    keys.forEach((k, i) => (at.get(k) || []).forEach((j) => votes.set(j - i, (votes.get(j - i) || 0) + 1)));
+    let best = null;
+    for (const [off, v] of votes) {
+      if (!best || v > best.votes || (v === best.votes && Math.abs(off - hint) < Math.abs(best.off - hint))) best = { off, votes: v };
+    }
+    return best;
+  }
+
+  // Write keys into seg at offset off (prepending/appending as needed); returns keys[0]'s new index
+  function mergeInto(seg, keys, off) {
+    let changed = false;
+    if (off < 0) { seg.keys.unshift(...keys.slice(0, -off)); off = 0; changed = true; }
+    keys.forEach((k, i) => { if (seg.keys[off + i] !== k) { seg.keys[off + i] = k; changed = true; } });
+    return { off, changed };
+  }
+
+  // Merge the loaded window (keys in page order, y = its top in the scroll content) into state.seq.
+  // Returns the absolute position of the window's first message.
+  function alignWindow(keys, y) {
+    if (!keys.length) return null;
+    const segs = state.seq;
+    const hits = segs.map((seg) => ({ seg, m: bestOffset(seg.keys, keys, seg.hint || 0) })).filter((x) => x.m);
+    let changed = false;
+    let seg;
+    let off;
+    if (!hits.length) {
+      // nothing in common with what we've seen: a new segment, placed by its vertical position
+      seg = { y, keys: keys.slice() };
+      const at = segs.findIndex((s) => s.y > y);
+      segs.splice(at < 0 ? segs.length : at, 0, seg);
+      off = 0;
+      changed = true;
+    } else {
+      hits.sort((a, b) => b.m.votes - a.m.votes);
+      seg = hits[0].seg;
+      const r = mergeInto(seg, keys, hits[0].m.off);
+      off = r.off;
+      changed = r.changed;
+      if (off === 0) seg.y = y;
+      // the window also touches other segments: they belong to this one
+      for (const { seg: other } of hits.slice(1)) {
+        const m = bestOffset(seg.keys, other.keys);
+        if (!m) continue;
+        mergeInto(seg, other.keys, m.off);
+        if (m.off < 0) off += -m.off; // seg grew at the front
+        segs.splice(segs.indexOf(other), 1);
+        changed = true;
+      }
+      seg.hint = off;
+    }
+    if (changed && state.items.length) { clearTimeout(seqSaveT); seqSaveT = setTimeout(save, 1500); }
+    let base = 0;
+    for (const s of segs) { if (s === seg) break; base += s.keys.length; }
+    return base + off;
+  }
+
+  // Top of an element in its scroll container's content coordinates
+  function contentY(el) {
+    const sc = getScroller(el);
+    return el.getBoundingClientRect().top - scrollerTop(sc) + (sc.scrollTop || 0);
+  }
+
+  const allKeys = () => state.seq.flatMap((s) => s.keys);
+
+  // Seen in this conversation (possibly not loaded right now)?
+  const isKnown = (bm) => state.seq.some((s) => s.keys.includes(keyOf(bm.role, bm.fp)));
+
+  // Absolute position of a bookmark's message, also when it isn't loaded right now
+  function absPos(bm, msgs = getMessages()) {
+    const m = locate(bm, msgs);
+    if (m && m.abs != null) { bm.pos = m.abs; return m.abs; }
+    const k = keyOf(bm.role, bm.fp);
+    const ref = bm.pos ?? bm.index ?? 0;
+    let found = null;
+    allKeys().forEach((x, j) => { if (x === k && (found == null || Math.abs(j - ref) < Math.abs(found - ref))) found = j; });
+    return found ?? ref;
+  }
+
   // ===== Data =====
   // items: bookmarks in display order; each has groupId (null = ungrouped)
   // groups: [{ id, name, collapsed }] in display order
-  const state = { convId: null, items: [], groups: [] };
+  const state = { convId: null, items: [], groups: [], seq: [] };
   let lastSavedTitle = '';
 
   function applyConv(conv) {
     state.items = conv?.items || [];
     state.groups = conv?.groups || [];
+    state.seq = Array.isArray(conv?.seq) ? conv.seq.filter((s) => s && Array.isArray(s.keys)).map((s) => ({ y: s.y, keys: [...s.keys] })) : [];
     // Data saved before manual ordering existed: start in conversation order
     if (conv && !conv.ordered) state.items.sort((a, b) => a.index - b.index || a.createdAt - b.createdAt);
     const ids = new Set(state.groups.map((g) => g.id));
@@ -119,14 +222,16 @@
     await chrome.storage.local.set({
       [k]: {
         id, title: lastSavedTitle, url: `${location.origin}/chat/${id}`, updatedAt: Date.now(),
-        ordered: true, items: state.items, groups: state.groups,
+        ordered: true, items: state.items, groups: state.groups, seq: state.seq.map((s) => ({ y: Math.round(s.y), keys: s.keys })),
       },
     });
   }
 
   // ===== Locate a bookmark's message =====
   function locate(bm, msgs = getMessages()) {
-    const near = (arr) => arr.sort((a, b) => Math.abs(a.index - bm.index) - Math.abs(b.index - bm.index))[0];
+    const ref = bm.pos ?? bm.index;
+    const dist = (m) => Math.abs((m.abs ?? m.index) - ref);
+    const near = (arr) => arr.sort((a, b) => dist(a) - dist(b))[0];
     const same = msgs.filter((m) => m.role === bm.role);
     let c = same.filter((m) => fpOf(m) === bm.fp);
     if (c.length && bm.quote) {
@@ -140,7 +245,7 @@
       const scored = msgs
         .map((m) => ({ m, mt: quoteMatch(strip(m.el.textContent), bm) }))
         .filter((x) => x.mt)
-        .sort((a, b) => b.mt.score - a.mt.score || Math.abs(a.m.index - bm.index) - Math.abs(b.m.index - bm.index));
+        .sort((a, b) => b.mt.score - a.mt.score || dist(a.m) - dist(b.m));
       if (scored.length) return scored[0].m;
     }
     const head = (bm.fp || '').slice(0, 60);
@@ -237,12 +342,61 @@
 
   function jump(bm) {
     const m = locate(bm);
-    if (!m) { toast('This message isn’t on the current page (it may have been edited, be on another branch, or not be loaded yet)'); return false; }
+    if (!m) { loadAndJump(bm); return false; }
+    if (loading) loading.cancel = true;
     const { range, top } = anchorOf(bm, m);
     const sc = getScroller(m.el);
     sc.scrollBy({ top: top - scrollerTop(sc) - JUMP_OFFSET, behavior: 'smooth' });
     flash(m.el, range);
     return true;
+  }
+
+  // Scroll toward a bookmark that isn't loaded until claude.ai renders it, then jump to it
+  let loading = null;
+  async function loadAndJump(bm) {
+    if (loading) loading.cancel = true;
+    const job = (loading = { cancel: false });
+    const target = isKnown(bm) ? absPos(bm) : null;
+    toast('Loading the conversation to find this bookmark…');
+    let dir = 0;
+    let stuck = 0;
+    let flipped = false;
+    let lastSig = '';
+    for (let i = 0; i < 80 && !job.cancel; i++) {
+      msgCache = null;
+      const msgs = getMessages();
+      if (locate(bm, msgs)) { loading = null; jump(bm); return; }
+      if (!msgs.length) break;
+      const first = msgs[0];
+      const last = msgs[msgs.length - 1];
+      // known position: go straight there; unknown: try earlier messages first, then later ones
+      if (!dir) dir = target != null && last.abs != null && target > last.abs ? 1 : -1;
+      const sig = `${keyOf(first.role, fpOf(first))}:${msgs.length}:${keyOf(last.role, fpOf(last))}`;
+      stuck = sig === lastSig ? stuck + 1 : 0;
+      lastSig = sig;
+      if (stuck >= 4) { // nothing more loads in this direction (~3s without changes)
+        if (target != null || flipped) break;
+        dir = -dir; flipped = true; stuck = 0;
+      }
+      const sc = getScroller(first.el);
+      (dir < 0 ? first.el : last.el).scrollIntoView({ block: dir < 0 ? 'start' : 'end' });
+      sc.scrollBy(0, dir * sc.clientHeight * 0.9);
+      await waitForPageChange(800);
+    }
+    if (loading === job) loading = null;
+    if (!job.cancel) toast('Couldn’t find this message (it may have been edited or be on another branch)');
+  }
+
+  // Resolves shortly after the page (not our own UI) changes, or after ms
+  function waitForPageChange(ms) {
+    return new Promise((resolve) => {
+      const done = () => { mo.disconnect(); clearTimeout(t); resolve(); };
+      const mo = new MutationObserver((muts) => {
+        if (muts.some((x) => !isOurs(x.target.nodeType === 1 ? x.target : x.target.parentElement))) setTimeout(done, 150);
+      });
+      mo.observe(document.body, { childList: true, subtree: true });
+      const t = setTimeout(done, ms);
+    });
   }
 
   function flash(el, range) {
@@ -280,7 +434,7 @@
       : !b.quote));
     if (dup) { toast(passage ? 'This passage is already bookmarked' : 'This message is already bookmarked'); return; }
     const bm = {
-      id: uid(), role: m.role, index: m.index, fp, quote: '',
+      id: uid(), role: m.role, index: m.index, pos: m.abs ?? m.index, fp, quote: '',
       snippet: norm(m.el.textContent).slice(0, 160),
       note: '', groupId: null, createdAt: Date.now(),
       ...passage,
@@ -348,8 +502,8 @@
   function positionKey(bm, msgs) {
     const m = locate(bm, msgs);
     let offset = -1;
-    if (bm.quote && m) offset = quoteMatch(strip(m.el.textContent), bm)?.at ?? 0;
-    return [m ? m.index : bm.index, offset];
+    if (bm.quote) offset = (m && quoteMatch(strip(m.el.textContent), bm)?.at) ?? bm.qOffset ?? 0;
+    return [absPos(bm, msgs), offset];
   }
   const comparePos = (ka, kb) => ka[0] - kb[0] || ka[1] - kb[1];
 
@@ -530,9 +684,20 @@
     return input;
   }
 
-  function renderItem(bm, missing) {
-    const item = h('div', 'cbm-item' + (missing ? ' cbm-missing' : ''));
+  // '' | 'cbm-unloaded' (seen in this conversation but not in the page right now) | 'cbm-missing'
+  function statusOf(bm, msgs) {
+    if (locate(bm, msgs)) return '';
+    return isKnown(bm) ? 'cbm-unloaded' : 'cbm-missing';
+  }
+  const STATUS_TITLE = {
+    'cbm-unloaded': 'Not loaded in the page yet — click to load it and jump there',
+    'cbm-missing': 'Not found in this conversation (edited, on another branch, or never loaded since this update) — click to search',
+  };
+
+  function renderItem(bm, status) {
+    const item = h('div', 'cbm-item' + (status ? ` ${status}` : ''));
     item.dataset.id = bm.id;
+    if (status) item.title = STATUS_TITLE[status];
     const top = h('div', 'cbm-row');
     const grip = h('span', 'cbm-grip', '⠿');
     top.append(grip);
@@ -551,10 +716,10 @@
     return item;
   }
 
-  function renderItems(items, missingIds, groupId) {
+  function renderItems(items, statuses, groupId) {
     const box = h('div', 'cbm-items');
     box.dataset.group = groupId || '';
-    for (const bm of items) box.append(renderItem(bm, missingIds.has(bm.id)));
+    for (const bm of items) box.append(renderItem(bm, statuses.get(bm.id)));
     if (!items.length) box.append(h('div', 'cbm-drop-hint', groupId ? 'Drag bookmarks here' : 'Drag here to ungroup'));
     return box;
   }
@@ -564,7 +729,7 @@
     updateTab();
     if (!panel.classList.contains('open') || drag.active) return;
     const msgs = getMessages();
-    const missing = new Set(state.items.filter((b) => !locate(b, msgs)).map((b) => b.id));
+    const statuses = new Map(state.items.map((b) => [b.id, statusOf(b, msgs)]));
     viewKeys = new Map(state.items.map((b) => [b.id, positionKey(b, msgs)]));
     const listScroll = panel.querySelector('.cbm-list')?.scrollTop || 0;
 
@@ -595,7 +760,7 @@
       // Ungrouped bookmarks always come first
       const loose = inView(state.items.filter((b) => !b.groupId), viewKeys);
       const ungrouped = h('section', 'cbm-section cbm-ungrouped' + (loose.length ? '' : ' empty'));
-      ungrouped.append(renderItems(loose, missing, null));
+      ungrouped.append(renderItems(loose, statuses, null));
       list.append(ungrouped);
 
       for (const g of state.groups) {
@@ -613,7 +778,7 @@
         gh.append(h('span', 'cbm-count', String(items.length)));
         gh.append(iconBtn('🗑', 'Delete group (its bookmarks move to the top)', () => removeGroup(g.id)));
         sec.append(gh);
-        if (!g.collapsed) sec.append(renderItems(items, missing, g.id));
+        if (!g.collapsed) sec.append(renderItems(items, statuses, g.id));
         list.append(sec);
       }
     }
@@ -838,10 +1003,9 @@
     const msgs = getMessages();
     const marked = new Set();
     const ranges = [];
-    const missing = new Set();
     for (const bm of state.items) {
       const m = locate(bm, msgs);
-      if (!m) { missing.add(bm.id); continue; }
+      if (!m) continue;
       marked.add(m.el);
       if (bm.quote && HL) {
         const r = findQuoteRange(m.el, bm);
@@ -856,7 +1020,15 @@
       if (ranges.length) CSS.highlights.set('cbm-quote', new Highlight(...ranges));
       else CSS.highlights.delete('cbm-quote');
     }
-    panel.querySelectorAll('.cbm-item').forEach((el) => el.classList.toggle('cbm-missing', missing.has(el.dataset.id)));
+    const byId = new Map(state.items.map((b) => [b.id, b]));
+    panel.querySelectorAll('.cbm-panel .cbm-item').forEach((el) => {
+      const bm = byId.get(el.dataset.id);
+      if (!bm) return;
+      const s = statusOf(bm, msgs);
+      el.classList.toggle('cbm-unloaded', s === 'cbm-unloaded');
+      el.classList.toggle('cbm-missing', s === 'cbm-missing');
+      if (s) el.title = STATUS_TITLE[s]; else el.removeAttribute('title');
+    });
     updateTab();
   }
 
@@ -868,9 +1040,12 @@
     if (Date.now() - p.ts > 60000) { chrome.storage.local.remove(PENDING_KEY); return; }
     if (p.convId !== getConvId()) return;
     const bm = state.items.find((b) => b.id === p.bmId);
-    if (!bm || !locate(bm)) return; // message may not be loaded yet; wait for the next DOM change
+    if (!bm || tryPending.busy) return;
+    if (!locate(bm) && Date.now() - p.ts < 2500) { setTimeout(tryPending, 800); return; } // let the page load first
+    tryPending.busy = true;
     await chrome.storage.local.remove(PENDING_KEY);
-    setTimeout(() => jump(bm), 300);
+    tryPending.busy = false;
+    setTimeout(() => jump(bm), 300); // jump() loads the message first if needed
   }
 
   // ===== Events: keyboard, storage sync, navigation, DOM changes =====
@@ -886,9 +1061,11 @@
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
     if (state.convId && changes[convKey(state.convId)]) {
+      const before = JSON.stringify([state.items, state.groups]);
       applyConv(changes[convKey(state.convId)].newValue);
+      msgCache = null;
       refreshMarks();
-      if (!panel.contains(document.activeElement)) render();
+      if (JSON.stringify([state.items, state.groups]) !== before && !panel.contains(document.activeElement)) render();
       tryPending();
     }
     if (changes[PENDING_KEY]?.newValue) tryPending();
@@ -900,6 +1077,7 @@
 
   async function onNavigate() {
     await Promise.all([load(), loadSettings()]);
+    msgCache = null;
     refreshMarks();
     render();
     tryPending();

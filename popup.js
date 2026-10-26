@@ -43,7 +43,7 @@ async function render() {
     const gname = new Map(groups.map((g) => [g.id, g.name || 'Untitled group']));
     const all = [...(conv.items || [])];
     // Same setting as the side panel's "Sort by position in conversation" checkbox
-    if (!conv.ordered || settings.sortByPosition) all.sort((a, b) => a.index - b.index || a.createdAt - b.createdAt);
+    if (!conv.ordered || settings.sortByPosition) all.sort((a, b) => (a.pos ?? a.index) - (b.pos ?? b.index) || (a.qOffset ?? -1) - (b.qOffset ?? -1) || a.createdAt - b.createdAt);
     // Same order as the side panel: ungrouped first, then each group in order
     const ordered = [
       ...all.filter((b) => !gname.has(b.groupId)),

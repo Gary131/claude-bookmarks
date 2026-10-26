@@ -37,7 +37,8 @@ Bookmarked messages get an orange bar on their left edge, and bookmarked passage
 
 - Data lives in `chrome.storage.local`, one key per conversation (`conv:<conversation UUID>`), and never leaves your machine. Each entry stores the bookmarks in display order plus the conversation's groups.
 - A bookmark is located by its role (you / Claude), a fingerprint of the message's first 200 characters, and its message index, so it still resolves after new messages are added earlier in the page. Passage bookmarks also store the quoted text, its offset in the message, and up to 32 characters of text before and after it (all compared ignoring whitespace). When the same text appears more than once, the occurrence whose surrounding text matches best wins, then the one closest to the saved offset, so even a single character or a common word resolves to the spot you selected.
-- If a message has been edited or you switch to another branch of the conversation, its bookmark is dimmed in the panel to show it can't be found on the current page.
+- claude.ai keeps only part of a long conversation in the page and loads the rest as you scroll. The extension records the order of every message it has seen (merging the loaded windows as you scroll), so sorting by position stays correct for bookmarks whose messages aren't loaded right now, and clicking such a bookmark scrolls the conversation until the message loads, then jumps to it.
+- If a message has been edited or you switch to another branch of the conversation, its bookmark is dimmed in the panel; clicking it searches the whole conversation before reporting that it can't be found.
 - Dragging uses pointer events rather than HTML5 drag and drop, so it never triggers claude.ai's file-drop overlay.
 
 ## When claude.ai changes its layout
