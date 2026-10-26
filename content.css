@@ -92,6 +92,9 @@ html.dark .cbm-ui, html[data-mode="dark"] .cbm-ui, html[data-theme="dark"] .cbm-
 .cbm-bar { display: flex; align-items: center; gap: 6px; padding: 6px 12px; border-bottom: 1px solid var(--cbm-border); color: var(--cbm-muted); font-size: 12px; cursor: pointer; user-select: none; }
 .cbm-bar:hover { color: var(--cbm-fg); }
 .cbm-bar input { margin: 0; accent-color: var(--cbm-accent); cursor: pointer; }
+.cbm-scan { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 4px 8px 4px 12px; border-bottom: 1px solid var(--cbm-border); color: var(--cbm-muted); font-size: 12px; }
+.cbm-scan .cbm-icon-btn { border: 1px solid var(--cbm-border); color: var(--cbm-fg); font-size: 12px; }
+.cbm-scan .cbm-icon-btn:hover { border-color: var(--cbm-accent); }
 
 /* Groups */
 .cbm-list { position: relative; }

@@ -12,6 +12,23 @@ function h(tag, cls, text) {
   return e;
 }
 
+// Same message keys as content.js (role + hash of the message fingerprint)
+const hash = (s) => {
+  let x = 2166136261;
+  for (let i = 0; i < s.length; i++) { x ^= s.charCodeAt(i); x = Math.imul(x, 16777619); }
+  return (x >>> 0).toString(36);
+};
+const keyOf = (role, fp) => (role === 'user' ? 'u' : 'a') + hash(fp || '');
+
+// Position of each bookmark in the conversation, from the order the side panel recorded
+// (bookmarks whose messages haven't been seen go last)
+function positions(conv) {
+  const keys = (conv.seq || []).flatMap((s) => s.keys || []);
+  const at = new Map();
+  keys.forEach((k, i) => { if (!at.has(k)) at.set(k, i); });
+  return new Map((conv.items || []).map((b) => [b.id, at.get(keyOf(b.role, b.fp)) ?? Number.MAX_SAFE_INTEGER]));
+}
+
 async function getSettings() {
   return (await chrome.storage.local.get('cbm_settings')).cbm_settings || {};
 }
@@ -43,7 +60,10 @@ async function render() {
     const gname = new Map(groups.map((g) => [g.id, g.name || 'Untitled group']));
     const all = [...(conv.items || [])];
     // Same setting as the side panel's "Sort by position in conversation" checkbox
-    if (!conv.ordered || settings.sortByPosition) all.sort((a, b) => (a.pos ?? a.index) - (b.pos ?? b.index) || (a.qOffset ?? -1) - (b.qOffset ?? -1) || a.createdAt - b.createdAt);
+    if (settings.sortByPosition) {
+      const pos = positions(conv);
+      all.sort((a, b) => pos.get(a.id) - pos.get(b.id) || (a.qOffset ?? -1) - (b.qOffset ?? -1) || a.createdAt - b.createdAt);
+    } else if (!conv.ordered) all.sort((a, b) => a.index - b.index);
     // Same order as the side panel: ungrouped first, then each group in order
     const ordered = [
       ...all.filter((b) => !gname.has(b.groupId)),

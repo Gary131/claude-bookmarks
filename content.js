@@ -173,10 +173,9 @@
 
   const allKeys = () => state.seq.flatMap((s) => s.keys);
 
-  // Seen in this conversation (possibly not loaded right now)?
-  const isKnown = (bm) => state.seq.some((s) => s.keys.includes(keyOf(bm.role, bm.fp)));
-
-  // Absolute position of a bookmark's message, also when it isn't loaded right now
+  // Absolute position of a bookmark's message (also when it isn't loaded right now), or null if its
+  // message hasn't been seen since the sequence started being recorded. Stored indexes (bm.index /
+  // bm.pos) come from other numberings, so they are only used to choose between duplicates.
   function absPos(bm, msgs = getMessages()) {
     const m = locate(bm, msgs);
     if (m && m.abs != null) { bm.pos = m.abs; return m.abs; }
@@ -184,8 +183,11 @@
     const ref = bm.pos ?? bm.index ?? 0;
     let found = null;
     allKeys().forEach((x, j) => { if (x === k && (found == null || Math.abs(j - ref) < Math.abs(found - ref))) found = j; });
-    return found ?? ref;
+    return found;
   }
+
+  // Seen in this conversation (possibly not loaded right now)?
+  const isKnown = (bm, msgs) => absPos(bm, msgs) != null;
 
   // ===== Data =====
   // items: bookmarks in display order; each has groupId (null = ungrouped)
@@ -193,10 +195,12 @@
   const state = { convId: null, items: [], groups: [], seq: [] };
   let lastSavedTitle = '';
 
-  function applyConv(conv) {
+  // keepSeq: the conversation order is built by this tab while it reads the page; a storage update
+  // (usually our own save, possibly older than what we've seen since) must not roll it back
+  function applyConv(conv, { keepSeq = false } = {}) {
     state.items = conv?.items || [];
     state.groups = conv?.groups || [];
-    state.seq = Array.isArray(conv?.seq) ? conv.seq.filter((s) => s && Array.isArray(s.keys)).map((s) => ({ y: s.y, keys: [...s.keys] })) : [];
+    if (!keepSeq) state.seq = Array.isArray(conv?.seq) ? conv.seq.filter((s) => s && Array.isArray(s.keys)).map((s) => ({ y: s.y, keys: [...s.keys] })) : [];
     // Data saved before manual ordering existed: start in conversation order
     if (conv && !conv.ordered) state.items.sort((a, b) => a.index - b.index || a.createdAt - b.createdAt);
     const ids = new Set(state.groups.map((g) => g.id));
@@ -248,10 +252,14 @@
         .sort((a, b) => b.mt.score - a.mt.score || dist(a.m) - dist(b.m));
       if (scored.length) return scored[0].m;
     }
-    const head = (bm.fp || '').slice(0, 60);
-    if (head.length >= 20) {
-      c = same.filter((m) => fpOf(m).startsWith(head));
-      if (c.length) return near(c);
+    // fingerprint changed (e.g. a tool-use summary inside the message re-rendered differently):
+    // the same-role message sharing the longest beginning, if it shares at least 40 characters
+    const fp = bm.fp || '';
+    if (fp.length >= 40) {
+      const lcp = (a) => { let i = 0; while (i < a.length && a[i] === fp[i]) i++; return i; };
+      const scored = same.map((m) => ({ m, n: lcp(fpOf(m)) })).filter((x) => x.n >= 40)
+        .sort((a, b) => b.n - a.n || dist(a.m) - dist(b.m));
+      if (scored.length) return scored[0].m;
     }
     return null;
   }
@@ -351,41 +359,89 @@
     return true;
   }
 
-  // Scroll toward a bookmark that isn't loaded until claude.ai renders it, then jump to it
-  let loading = null;
-  async function loadAndJump(bm) {
-    if (loading) loading.cancel = true;
-    const job = (loading = { cancel: false });
-    const target = isKnown(bm) ? absPos(bm) : null;
-    toast('Loading the conversation to find this bookmark…');
-    let dir = 0;
+  // Scroll the conversation step by step in one direction (-1 up, 1 down) until done(msgs) is true
+  // or nothing more loads (~3s without changes). Returns whether done() became true.
+  let loading = null; // the running scroll job: { cancel, scan }
+  async function scrollUntil(done, dir, job) {
     let stuck = 0;
-    let flipped = false;
     let lastSig = '';
-    for (let i = 0; i < 80 && !job.cancel; i++) {
+    for (let i = 0; i < 300 && !job.cancel; i++) {
       msgCache = null;
       const msgs = getMessages();
-      if (locate(bm, msgs)) { loading = null; jump(bm); return; }
-      if (!msgs.length) break;
+      if (!msgs.length) return false;
+      if (done(msgs)) return true;
       const first = msgs[0];
       const last = msgs[msgs.length - 1];
-      // known position: go straight there; unknown: try earlier messages first, then later ones
-      if (!dir) dir = target != null && last.abs != null && target > last.abs ? 1 : -1;
       const sig = `${keyOf(first.role, fpOf(first))}:${msgs.length}:${keyOf(last.role, fpOf(last))}`;
       stuck = sig === lastSig ? stuck + 1 : 0;
       lastSig = sig;
-      if (stuck >= 4) { // nothing more loads in this direction (~3s without changes)
-        if (target != null || flipped) break;
-        dir = -dir; flipped = true; stuck = 0;
-      }
+      if (stuck >= 4) return false;
       const sc = getScroller(first.el);
       (dir < 0 ? first.el : last.el).scrollIntoView({ block: dir < 0 ? 'start' : 'end' });
       sc.scrollBy(0, dir * sc.clientHeight * 0.9);
       await waitForPageChange(800);
     }
-    if (loading === job) loading = null;
-    if (!job.cancel) toast('Couldn’t find this message (it may have been edited or be on another branch)');
+    return false;
   }
+
+  // Bring a bookmark's message into the page: straight toward it when its position is known,
+  // otherwise earlier messages first, then later ones. Returns the message or null.
+  async function bringIntoPage(bm, job) {
+    const msgs = getMessages();
+    const found = (ms) => !!locate(bm, ms);
+    if (found(msgs)) return locate(bm, msgs);
+    const target = absPos(bm, msgs);
+    const last = msgs[msgs.length - 1];
+    const dir = target != null && last?.abs != null && target > last.abs ? 1 : -1;
+    if (await scrollUntil(found, dir, job)) return locate(bm);
+    if (target == null && !job.cancel && await scrollUntil(found, -dir, job)) return locate(bm);
+    return null;
+  }
+
+  function startJob(extra = {}) {
+    if (loading) loading.cancel = true;
+    return (loading = { cancel: false, ...extra });
+  }
+  function endJob(job) { if (loading === job) loading = null; }
+
+  // Jump to a bookmark whose message isn't loaded: load it first
+  async function loadAndJump(bm) {
+    const job = startJob();
+    toast('Loading the conversation to find this bookmark…');
+    const m = await bringIntoPage(bm, job);
+    endJob(job);
+    if (m) jump(bm);
+    else if (!job.cancel) toast('Couldn’t find this message (it may have been edited or be on another branch)');
+  }
+
+  // Scroll through the conversation once so every bookmark's position becomes known, then return to
+  // where the reader was. Only needed for bookmarks whose messages haven't loaded since they were added.
+  async function scanConversation() {
+    const job = startJob({ scan: true });
+    render();
+    const msgs = getMessages();
+    const here = msgs.find((m) => m.el.getBoundingClientRect().bottom > 80) || msgs[0];
+    const back = here && { role: here.role, fp: fpOf(here), quote: '', pos: here.abs, index: here.index };
+    const backTop = here ? here.el.getBoundingClientRect().top : 0;
+    const allKnown = (ms) => state.items.every((b) => isKnown(b, ms));
+    if (!allKnown(msgs)) await scrollUntil(allKnown, -1, job);
+    if (!job.cancel && !allKnown(getMessages())) await scrollUntil(allKnown, 1, job);
+    // return to the message that was on screen, at the same height
+    if (back && !job.cancel) {
+      const m = await bringIntoPage(back, job);
+      if (m) getScroller(m.el).scrollBy(0, m.el.getBoundingClientRect().top - backTop);
+    }
+    const left = state.items.filter((b) => !isKnown(b)).length;
+    endJob(job);
+    if (!job.cancel) toast(left ? `${left} bookmark(s) couldn’t be found in this conversation` : 'All bookmarks located');
+    save();
+    msgCache = null;
+    render();
+  }
+
+  // Stop a running scan / load when the reader takes over
+  const stopJob = () => { if (loading) { loading.cancel = true; loading = null; render(); } };
+  window.addEventListener('wheel', (e) => { if (loading && !isOurs(e.target)) stopJob(); }, { passive: true, capture: true });
 
   // Resolves shortly after the page (not our own UI) changes, or after ms
   function waitForPageChange(ms) {
@@ -503,7 +559,7 @@
     const m = locate(bm, msgs);
     let offset = -1;
     if (bm.quote) offset = (m && quoteMatch(strip(m.el.textContent), bm)?.at) ?? bm.qOffset ?? 0;
-    return [absPos(bm, msgs), offset];
+    return [absPos(bm, msgs) ?? Number.MAX_SAFE_INTEGER, offset];
   }
   const comparePos = (ka, kb) => ka[0] - kb[0] || ka[1] - kb[1];
 
@@ -687,11 +743,11 @@
   // '' | 'cbm-unloaded' (seen in this conversation but not in the page right now) | 'cbm-missing'
   function statusOf(bm, msgs) {
     if (locate(bm, msgs)) return '';
-    return isKnown(bm) ? 'cbm-unloaded' : 'cbm-missing';
+    return isKnown(bm, msgs) ? 'cbm-unloaded' : 'cbm-missing';
   }
   const STATUS_TITLE = {
     'cbm-unloaded': 'Not loaded in the page yet — click to load it and jump there',
-    'cbm-missing': 'Not found in this conversation (edited, on another branch, or never loaded since this update) — click to search',
+    'cbm-missing': 'Position not known yet (not loaded since it was added, edited, or on another branch) — click to search, or use “Scan”',
   };
 
   function renderItem(bm, status) {
@@ -751,6 +807,18 @@
       cb.onchange = async () => { await setSetting('sortByPosition', cb.checked); render(); };
       bar.append(cb, h('span', null, 'Sort by position in conversation'));
       panel.append(bar);
+      const unknown = state.items.filter((b) => statuses.get(b.id) === 'cbm-missing').length;
+      if (loading?.scan) {
+        const row = h('div', 'cbm-scan');
+        row.append(h('span', null, 'Scanning the conversation…'));
+        row.append(iconBtn('Stop', 'Stop scanning (Esc)', stopJob));
+        panel.append(row);
+      } else if (settings.sortByPosition && unknown) {
+        const row = h('div', 'cbm-scan');
+        row.append(h('span', null, `${unknown} not located yet — listed last`));
+        row.append(iconBtn('Scan', 'Scroll through the conversation once to find every bookmark’s position, then come back here', scanConversation));
+        panel.append(row);
+      }
     }
 
     const list = h('div', 'cbm-list');
@@ -995,6 +1063,7 @@
   document.addEventListener('pointercancel', () => endDrag(false));
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && drag.active) { e.preventDefault(); e.stopPropagation(); endDrag(false); }
+    else if (e.key === 'Escape' && loading) { e.preventDefault(); stopJob(); }
   }, true);
   window.addEventListener('blur', () => endDrag(false));
 
@@ -1062,7 +1131,7 @@
     if (area !== 'local') return;
     if (state.convId && changes[convKey(state.convId)]) {
       const before = JSON.stringify([state.items, state.groups]);
-      applyConv(changes[convKey(state.convId)].newValue);
+      applyConv(changes[convKey(state.convId)].newValue, { keepSeq: true });
       msgCache = null;
       refreshMarks();
       if (JSON.stringify([state.items, state.groups]) !== before && !panel.contains(document.activeElement)) render();
