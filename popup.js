@@ -35,9 +35,17 @@ async function render() {
   let shown = 0;
   for (const conv of convs) {
     const titleHit = (conv.title || '').toLowerCase().includes(q);
-    const items = (conv.items || [])
-      .filter((b) => !q || titleHit || `${b.note} ${b.snippet} ${b.quote}`.toLowerCase().includes(q))
-      .sort((a, b) => a.index - b.index);
+    const groups = conv.groups || [];
+    const gname = new Map(groups.map((g) => [g.id, g.name || 'Untitled group']));
+    const all = [...(conv.items || [])];
+    if (!conv.ordered) all.sort((a, b) => a.index - b.index);
+    // Same order as the side panel: ungrouped first, then each group in order
+    const ordered = [
+      ...all.filter((b) => !gname.has(b.groupId)),
+      ...groups.flatMap((g) => all.filter((b) => b.groupId === g.id)),
+    ];
+    const items = ordered.filter((b) => !q || titleHit ||
+      `${b.note} ${b.snippet} ${b.quote} ${gname.get(b.groupId) || ''}`.toLowerCase().includes(q));
     if (!items.length) continue;
     shown++;
 
@@ -49,7 +57,11 @@ async function render() {
     head.onclick = () => openConv(conv.id, null);
     box.append(head);
 
+    let lastGroup;
     for (const b of items) {
+      const g = gname.has(b.groupId) ? b.groupId : null;
+      if (g !== lastGroup && g) box.append(h('div', 'group-label', gname.get(g)));
+      lastGroup = g;
       const row = h('div', 'bm');
       row.append(h('span', `role ${b.role}`, b.role === 'user' ? 'You' : 'Claude'));
       const body = h('div', 'bm-body');
@@ -62,7 +74,7 @@ async function render() {
         e.stopPropagation();
         conv.items = conv.items.filter((x) => x.id !== b.id);
         const key = `conv:${conv.id}`;
-        if (conv.items.length) await chrome.storage.local.set({ [key]: { ...conv, updatedAt: Date.now() } });
+        if (conv.items.length || (conv.groups || []).length) await chrome.storage.local.set({ [key]: { ...conv, updatedAt: Date.now() } });
         else await chrome.storage.local.remove(key);
         render();
       };
@@ -134,11 +146,18 @@ $('#file').onchange = async (e) => {
     for (const c of convs) {
       if (!c.id || !Array.isArray(c.items)) continue;
       const key = `conv:${c.id}`;
-      const cur = existing[key] || { ...c, items: [] };
+      const cur = existing[key] || { ...c, items: [], groups: [] };
+      // Files from older versions have no manual order: use conversation order
+      const inOrder = (conv) => (conv.ordered ? [...conv.items] : [...conv.items].sort((a, b) => a.index - b.index));
       const ids = new Set(cur.items.map((b) => b.id));
-      const fresh = c.items.filter((b) => !ids.has(b.id));
+      const fresh = inOrder(c).filter((b) => !ids.has(b.id));
+      const gids = new Set((cur.groups || []).map((g) => g.id));
+      const groups = [...(cur.groups || []), ...(c.groups || []).filter((g) => !gids.has(g.id))];
       added += fresh.length;
-      updates[key] = { ...cur, title: cur.title || c.title, items: [...cur.items, ...fresh], updatedAt: Math.max(cur.updatedAt || 0, c.updatedAt || 0) };
+      updates[key] = {
+        ...cur, title: cur.title || c.title, ordered: true, groups,
+        items: [...inOrder(cur), ...fresh], updatedAt: Math.max(cur.updatedAt || 0, c.updatedAt || 0),
+      };
     }
     await chrome.storage.local.set(updates);
     alert(`Import complete: ${added} bookmark(s) added`);

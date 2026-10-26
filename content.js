@@ -86,16 +86,27 @@
   const fpOf = (m) => (m.fp ??= fingerprint(m.el));
 
   // ===== Data =====
-  const state = { convId: null, items: [] };
+  // items: bookmarks in display order; each has groupId (null = ungrouped)
+  // groups: [{ id, name, collapsed }] in display order
+  const state = { convId: null, items: [], groups: [] };
   let lastSavedTitle = '';
+
+  function applyConv(conv) {
+    state.items = conv?.items || [];
+    state.groups = conv?.groups || [];
+    // Data saved before manual ordering existed: start in conversation order
+    if (conv && !conv.ordered) state.items.sort((a, b) => a.index - b.index || a.createdAt - b.createdAt);
+    const ids = new Set(state.groups.map((g) => g.id));
+    for (const b of state.items) if (!ids.has(b.groupId)) b.groupId = null;
+  }
 
   async function load() {
     state.convId = getConvId();
-    state.items = [];
+    applyConv(null);
     if (!state.convId || !alive()) return;
     const r = await chrome.storage.local.get(convKey(state.convId));
     const conv = r[convKey(state.convId)];
-    state.items = conv?.items || [];
+    applyConv(conv);
     lastSavedTitle = conv?.title || '';
   }
 
@@ -103,10 +114,13 @@
     const id = state.convId;
     if (!id || !alive()) return;
     const k = convKey(id);
-    if (!state.items.length) { await chrome.storage.local.remove(k); return; }
+    if (!state.items.length && !state.groups.length) { await chrome.storage.local.remove(k); return; }
     lastSavedTitle = getTitle();
     await chrome.storage.local.set({
-      [k]: { id, title: lastSavedTitle, url: `${location.origin}/chat/${id}`, updatedAt: Date.now(), items: state.items },
+      [k]: {
+        id, title: lastSavedTitle, url: `${location.origin}/chat/${id}`, updatedAt: Date.now(),
+        ordered: true, items: state.items, groups: state.groups,
+      },
     });
   }
 
@@ -214,7 +228,7 @@
     const bm = {
       id: uid(), role: m.role, index: m.index, fp, quote,
       snippet: (quote || norm(m.el.textContent)).slice(0, 160),
-      note: '', createdAt: Date.now(),
+      note: '', groupId: null, createdAt: Date.now(),
     };
     state.items.push(bm);
     await save();
@@ -230,6 +244,70 @@
     state.items = state.items.filter((b) => b.id !== id);
     await save();
     refreshMarks();
+    render();
+  }
+
+  // ===== Groups =====
+  async function addGroup() {
+    const g = { id: uid(), name: '', collapsed: false };
+    state.groups.push(g);
+    await save();
+    render();
+    const input = panel.querySelector(`[data-gid="${g.id}"] .cbm-group-name`);
+    if (input) { input.focus(); input.scrollIntoView({ block: 'nearest' }); }
+  }
+
+  async function removeGroup(gid) {
+    // Bookmarks in the group are kept and move to "Ungrouped"
+    for (const b of state.items) if (b.groupId === gid) b.groupId = null;
+    state.groups = state.groups.filter((g) => g.id !== gid);
+    await save();
+    render();
+  }
+
+  async function updateGroup(gid, patch) {
+    const g = state.groups.find((x) => x.id === gid);
+    if (!g) return;
+    Object.assign(g, patch);
+    await save();
+  }
+
+  // Sort bookmarks inside each group by where they appear in the conversation
+  async function sortByPosition() {
+    const msgs = getMessages();
+    const pos = new Map(state.items.map((b) => {
+      const m = locate(b, msgs);
+      return [b.id, m ? m.index : b.index];
+    }));
+    state.items.sort((a, b) => pos.get(a.id) - pos.get(b.id) || a.createdAt - b.createdAt);
+    await save();
+    render();
+    toast('Sorted by position in the conversation');
+  }
+
+  // Move a bookmark into a group (null = ungrouped), before another bookmark (null = at the end)
+  async function moveItem(id, groupId, beforeId) {
+    const i = state.items.findIndex((b) => b.id === id);
+    if (i < 0 || id === beforeId) return;
+    const [bm] = state.items.splice(i, 1);
+    bm.groupId = groupId;
+    let at = beforeId ? state.items.findIndex((b) => b.id === beforeId) : -1;
+    if (at < 0) {
+      // after the last bookmark of the target group, keeping groups contiguous in the array
+      at = state.items.reduce((last, b, j) => (b.groupId === groupId ? j + 1 : last), state.items.length);
+    }
+    state.items.splice(at, 0, bm);
+    await save();
+    render();
+  }
+
+  async function moveGroup(gid, beforeGid) {
+    const i = state.groups.findIndex((g) => g.id === gid);
+    if (i < 0 || gid === beforeGid) return;
+    const [g] = state.groups.splice(i, 1);
+    const at = beforeGid ? state.groups.findIndex((x) => x.id === beforeGid) : -1;
+    state.groups.splice(at < 0 ? state.groups.length : at, 0, g);
+    await save();
     render();
   }
 
@@ -257,8 +335,10 @@
   function placeHover() {
     if (!hoverMsg || !hoverMsg.isConnected) { hoverBtn.classList.remove('show'); return; }
     const r = hoverMsg.getBoundingClientRect();
-    const y = Math.max(r.top + 4, 64);
-    if (y > r.bottom - 28) { hoverBtn.classList.remove('show'); return; }
+    if (r.bottom < 40 || r.top > window.innerHeight - 28) { hoverBtn.classList.remove('show'); return; }
+    // Prefer the message's top-right corner (kept below the page header); short messages center it vertically
+    let y = Math.max(r.top + 4, 64);
+    if (y > r.bottom - 28) y = Math.max(r.top + (r.height - 28) / 2, 8);
     let x = r.right + 6;
     if (x + 30 > window.innerWidth - 8) x = r.right - 34;
     hoverBtn.style.top = `${y}px`;
@@ -348,56 +428,208 @@
     if (!state.convId) panel.classList.remove('open');
   }
 
+  function iconBtn(text, title, onclick) {
+    const b = h('button', 'cbm-icon-btn', text);
+    b.title = title;
+    b.onclick = (e) => { e.stopPropagation(); onclick(e); };
+    return b;
+  }
+
+  function textInput(cls, value, placeholder, onSave) {
+    const input = h('input', cls);
+    input.value = value || '';
+    input.placeholder = placeholder;
+    input.onkeydown = (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter' || e.key === 'Escape') input.blur();
+    };
+    input.onchange = () => onSave(input.value.trim());
+    return input;
+  }
+
+  function renderItem(bm, missing) {
+    const item = h('div', 'cbm-item' + (missing ? ' cbm-missing' : ''));
+    item.dataset.id = bm.id;
+    const top = h('div', 'cbm-row');
+    const grip = h('span', 'cbm-grip', '⠿');
+    grip.title = 'Drag to reorder or move to a group';
+    grip.dataset.drag = 'item';
+    top.append(grip);
+    top.append(h('span', `cbm-role ${bm.role}`, bm.role === 'user' ? 'You' : 'Claude'));
+    top.append(textInput('cbm-note', bm.note, 'Add a note…', async (v) => {
+      const b = state.items.find((x) => x.id === bm.id);
+      if (b) { b.note = v; await save(); }
+    }));
+    top.append(iconBtn('🗑', 'Delete bookmark', () => removeBookmark(bm.id)));
+    item.append(top);
+    item.append(h('div', 'cbm-snippet' + (bm.quote ? ' quote' : ''), bm.quote ? `“${bm.snippet}”` : bm.snippet));
+    item.onclick = (e) => {
+      if (drag.justDropped || isEditable(e.target) || e.target.closest('button, .cbm-grip')) return;
+      jump(bm);
+    };
+    return item;
+  }
+
+  function renderItems(items, missingIds, groupId) {
+    const box = h('div', 'cbm-items');
+    box.dataset.group = groupId || '';
+    for (const bm of items) box.append(renderItem(bm, missingIds.has(bm.id)));
+    if (!items.length) box.append(h('div', 'cbm-drop-hint', groupId ? 'Drag bookmarks here' : 'Drag here to ungroup'));
+    return box;
+  }
+
   function render() {
     updateTab();
-    if (!panel.classList.contains('open')) return;
+    if (!panel.classList.contains('open') || drag.active) return;
     const msgs = getMessages();
-    const rows = state.items.map((bm) => {
-      const m = locate(bm, msgs);
-      return { bm, m, order: m ? m.index : bm.index };
-    }).sort((a, b) => a.order - b.order || a.bm.createdAt - b.bm.createdAt);
+    const missing = new Set(state.items.filter((b) => !locate(b, msgs)).map((b) => b.id));
+    const listScroll = panel.querySelector('.cbm-list')?.scrollTop || 0;
 
     panel.replaceChildren();
     const head = h('div', 'cbm-head');
-    head.append(h('span', 'cbm-title', `🔖 Bookmarks (${rows.length})`));
-    const close = h('button', 'cbm-icon-btn', '✕');
-    close.title = 'Close (Alt+B)';
-    close.onclick = () => setPanel(false);
-    head.append(close);
+    head.append(h('span', 'cbm-title', `🔖 Bookmarks (${state.items.length})`));
+    const tools = h('div', 'cbm-tools');
+    tools.append(iconBtn('＋ Group', 'New group', addGroup));
+    tools.append(iconBtn('⇅', 'Sort each group by position in the conversation', sortByPosition));
+    tools.append(iconBtn('✕', 'Close (Alt+B)', () => setPanel(false)));
+    head.append(tools);
     panel.append(head);
 
     const list = h('div', 'cbm-list');
-    if (!rows.length) {
+    if (!state.items.length && !state.groups.length) {
       list.append(h('div', 'cbm-empty', 'Hover over a message and click 🔖, or select some text and click “Bookmark selection”.'));
-    }
-    for (const { bm, m } of rows) {
-      const item = h('div', 'cbm-item' + (m ? '' : ' cbm-missing'));
-      item.dataset.id = bm.id;
-      const top = h('div', 'cbm-row');
-      top.append(h('span', `cbm-role ${bm.role}`, bm.role === 'user' ? 'You' : 'Claude'));
-      const note = h('input', 'cbm-note');
-      note.placeholder = 'Add a note…';
-      note.value = bm.note || '';
-      note.onkeydown = (e) => {
-        e.stopPropagation();
-        if (e.key === 'Enter' || e.key === 'Escape') note.blur();
-      };
-      note.onchange = async () => {
-        const b = state.items.find((x) => x.id === bm.id);
-        if (b) { b.note = note.value.trim(); await save(); }
-      };
-      top.append(note);
-      const del = h('button', 'cbm-icon-btn', '🗑');
-      del.title = 'Delete bookmark';
-      del.onclick = (e) => { e.stopPropagation(); removeBookmark(bm.id); };
-      top.append(del);
-      item.append(top);
-      item.append(h('div', 'cbm-snippet' + (bm.quote ? ' quote' : ''), bm.quote ? `“${bm.snippet}”` : bm.snippet));
-      item.onclick = (e) => { if (!isEditable(e.target) && e.target.tagName !== 'BUTTON') jump(bm); };
-      list.append(item);
+    } else {
+      // Ungrouped bookmarks always come first
+      const loose = state.items.filter((b) => !b.groupId);
+      const ungrouped = h('section', 'cbm-section cbm-ungrouped' + (loose.length ? '' : ' empty'));
+      ungrouped.append(renderItems(loose, missing, null));
+      list.append(ungrouped);
+
+      for (const g of state.groups) {
+        const items = state.items.filter((b) => b.groupId === g.id);
+        const sec = h('section', 'cbm-section cbm-group' + (g.collapsed ? ' collapsed' : ''));
+        sec.dataset.gid = g.id;
+        const gh = h('div', 'cbm-group-head');
+        const grip = h('span', 'cbm-grip', '⠿');
+        grip.title = 'Drag to reorder groups';
+        grip.dataset.drag = 'group';
+        gh.append(grip);
+        gh.append(iconBtn(g.collapsed ? '▸' : '▾', g.collapsed ? 'Expand' : 'Collapse', async () => {
+          await updateGroup(g.id, { collapsed: !g.collapsed });
+          render();
+        }));
+        gh.append(textInput('cbm-group-name', g.name, 'Group name', (v) => updateGroup(g.id, { name: v })));
+        gh.append(h('span', 'cbm-count', String(items.length)));
+        gh.append(iconBtn('🗑', 'Delete group (its bookmarks move to the top)', () => removeGroup(g.id)));
+        sec.append(gh);
+        if (!g.collapsed) sec.append(renderItems(items, missing, g.id));
+        list.append(sec);
+      }
     }
     panel.append(list);
-    panel.append(h('div', 'cbm-foot', 'Alt+B toggle panel · Alt+↑/↓ previous/next bookmark'));
+    list.scrollTop = listScroll;
+    panel.append(h('div', 'cbm-foot', 'Drag ⠿ to reorder · Alt+B toggle panel · Alt+↑/↓ previous/next'));
+  }
+
+  // ===== Drag and drop (pointer-based, so claude.ai's file-drop handling is never triggered) =====
+  const drag = { active: false, pending: null, justDropped: false };
+  const dropLine = h('div', 'cbm-drop-line');
+
+  panel.addEventListener('pointerdown', (e) => {
+    const grip = e.target.closest('.cbm-grip');
+    if (!grip || e.button !== 0) return;
+    e.preventDefault();
+    const kind = grip.dataset.drag;
+    const el = grip.closest(kind === 'item' ? '.cbm-item' : '.cbm-group');
+    drag.pending = { kind, el, id: kind === 'item' ? el.dataset.id : el.dataset.gid, x: e.clientX, y: e.clientY };
+  });
+
+  document.addEventListener('pointermove', (e) => {
+    if (!drag.pending && !drag.active) return;
+    if (!drag.active) {
+      if (Math.hypot(e.clientX - drag.pending.x, e.clientY - drag.pending.y) < 4) return;
+      Object.assign(drag, drag.pending, { active: true, pending: null, target: null });
+      drag.el.classList.add('cbm-dragging');
+      panel.classList.add('cbm-drag-' + drag.kind);
+      panel.querySelector('.cbm-list').append(dropLine);
+      getSelection()?.removeAllRanges();
+    }
+    e.preventDefault();
+    drag.y = e.clientY;
+    updateDropTarget(e.clientX, e.clientY);
+    autoScroll();
+  });
+
+  function endDrag(commit) {
+    if (drag.pending) { drag.pending = null; return; }
+    if (!drag.active) return;
+    const { kind, id, target, el } = drag;
+    drag.active = false;
+    el.classList.remove('cbm-dragging');
+    panel.classList.remove('cbm-drag-item', 'cbm-drag-group');
+    dropLine.remove();
+    panel.querySelectorAll('.cbm-drop-into').forEach((x) => x.classList.remove('cbm-drop-into'));
+    drag.justDropped = true;
+    setTimeout(() => { drag.justDropped = false; }, 0);
+    if (!commit || !target) { render(); return; }
+    if (kind === 'item') moveItem(id, target.group, target.before);
+    else moveGroup(id, target.before);
+  }
+  document.addEventListener('pointerup', () => endDrag(true));
+  document.addEventListener('pointercancel', () => endDrag(false));
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && drag.active) endDrag(false); }, true);
+
+  // Pick the insertion point for the pointer position and draw the indicator line
+  function updateDropTarget(x, y) {
+    const list = panel.querySelector('.cbm-list');
+    panel.querySelectorAll('.cbm-drop-into').forEach((el) => el.classList.remove('cbm-drop-into'));
+    let line = null;
+
+    if (drag.kind === 'group') {
+      const secs = [...list.querySelectorAll('.cbm-group')].filter((s) => s !== drag.el);
+      const before = secs.find((s) => { const r = s.getBoundingClientRect(); return y < r.top + r.height / 2; });
+      drag.target = { before: before ? before.dataset.gid : null };
+      const ref = before || secs[secs.length - 1];
+      if (ref) line = before ? ref.getBoundingClientRect().top : ref.getBoundingClientRect().bottom;
+    } else {
+      const sections = [...list.querySelectorAll('.cbm-section')];
+      // The section under the pointer; above/below everything snaps to the first/last section
+      let sec = sections.find((s) => { const r = s.getBoundingClientRect(); return y >= r.top && y < r.bottom; });
+      if (!sec) sec = y < list.getBoundingClientRect().top + 40 ? sections[0] : sections[sections.length - 1];
+      if (!sec) return;
+      const gid = sec.dataset.gid || null;
+      const box = sec.querySelector('.cbm-items');
+      if (!box) {
+        // Collapsed group: drop at its end
+        drag.target = { group: gid, before: null };
+        sec.classList.add('cbm-drop-into');
+      } else {
+        const items = [...box.querySelectorAll('.cbm-item')].filter((i) => i !== drag.el);
+        const before = items.find((i) => { const r = i.getBoundingClientRect(); return y < r.top + r.height / 2; });
+        drag.target = { group: gid, before: before ? before.dataset.id : null };
+        if (before) line = before.getBoundingClientRect().top;
+        else if (items.length) line = items[items.length - 1].getBoundingClientRect().bottom;
+        else { sec.classList.add('cbm-drop-into'); }
+      }
+    }
+
+    if (line == null) { dropLine.style.display = 'none'; return; }
+    const lr = list.getBoundingClientRect();
+    dropLine.style.display = 'block';
+    dropLine.style.top = `${line - lr.top + list.scrollTop - 1}px`;
+  }
+
+  // Scroll the list while dragging near its top or bottom edge
+  function autoScroll() {
+    if (!drag.active) return;
+    const list = panel.querySelector('.cbm-list');
+    const r = list.getBoundingClientRect();
+    const zone = 36;
+    const dy = drag.y < r.top + zone ? -(r.top + zone - drag.y) : drag.y > r.bottom - zone ? drag.y - (r.bottom - zone) : 0;
+    if (!dy) return;
+    list.scrollTop += dy / 3;
+    cancelAnimationFrame(autoScroll.raf);
+    autoScroll.raf = requestAnimationFrame(() => { updateDropTarget(0, drag.y); autoScroll(); });
   }
 
   // ===== Mark bookmarked messages and passages =====
@@ -453,7 +685,7 @@
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
     if (state.convId && changes[convKey(state.convId)]) {
-      state.items = changes[convKey(state.convId)].newValue?.items || [];
+      applyConv(changes[convKey(state.convId)].newValue);
       refreshMarks();
       if (!panel.contains(document.activeElement)) render();
       tryPending();
