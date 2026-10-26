@@ -1,43 +1,47 @@
-# Claude 對話書籤（Chrome 擴充功能）
+# Claude Conversation Bookmarks (Chrome extension)
 
-在 claude.ai 的對話裡設定書籤、加備註，並快速跳回重要的訊息或段落。
+Bookmark messages or passages in claude.ai conversations, add notes, organize them into groups, and jump back to them quickly.
 
-## 安裝
+## Installation
 
-1. 解壓縮 `claude-bookmarks.zip`
-2. Chrome 開啟 `chrome://extensions`，打開右上角「開發人員模式」
-3. 點「載入未封裝項目」，選擇 `claude-bookmarks` 資料夾
-4. 重新整理 claude.ai 分頁
+1. Download or clone this folder
+2. Open `chrome://extensions` in Chrome and turn on **Developer mode** (top right)
+3. Click **Load unpacked** and select the `claude-bookmarks` folder
+4. Reload any open claude.ai tabs
 
-Edge、Brave、Arc 等 Chromium 瀏覽器也能用同樣方式安裝。
+Other Chromium-based browsers (Edge, Brave, Arc, …) work the same way.
 
-## 使用方式
+To update after changing the files, click the reload ↻ button on the extension's card in `chrome://extensions`, then reload the claude.ai tab.
 
-| 操作 | 方法 |
+## Usage
+
+| Action | How |
 |---|---|
-| 書籤整則訊息 | 滑鼠移到訊息上，點右上角的 🔖（再點一次移除） |
-| 書籤某一段文字 | 選取文字 → 點「🔖 書籤此段」，跳回時會高亮該段 |
-| 開關書籤面板 | 畫面右側的 🔖 標籤，或 `Alt+B` |
-| 上一個／下一個書籤 | `Alt+↑` / `Alt+↓` |
-| 加備註 | 新增書籤後直接輸入，或在面板中點備註欄編輯 |
-| 跨對話瀏覽 | 點工具列的擴充功能圖示，可搜尋所有對話的書籤並直接跳過去 |
-| 備份 | popup 的「匯出／匯入」（JSON，匯入為合併不覆蓋） |
+| Bookmark a whole message | Hover over a message (yours or Claude's) and click the 🔖 at its top right (click again to remove) |
+| Bookmark a passage | Select text → click **🔖 Bookmark selection**; the passage is highlighted when you jump back |
+| Open / close the panel | The 🔖 tab on the right edge of the page, or `Alt+B` |
+| Previous / next bookmark | `Alt+↑` / `Alt+↓` |
+| Add a note | Type right after adding a bookmark, or click a bookmark's note field in the panel |
+| Jump to a bookmark | Click it in the panel |
+| Reorder | Drag a bookmark anywhere except its note field and buttons |
+| Groups | **＋ Group** creates one; click its name to rename; ▾/▸ collapses it; drag its header to reorder groups |
+| Move between groups | Drag a bookmark into a group (collapsed groups accept drops too) or back to the top to ungroup |
+| Delete a group | 🗑 on the group header; its bookmarks move back to the ungrouped list |
+| Sort by position | **⇅** sorts the bookmarks in each group by where they appear in the conversation |
+| Browse all conversations | Click the extension's toolbar icon to search bookmarks across every conversation and jump straight to one |
+| Back up | **Export / Import** in the popup (JSON; import merges and never overwrites) |
 
-已加書籤的訊息左側會有一條橘色標記，引用段落會有淡黃色底色。
+Bookmarked messages get an orange bar on their left edge, and bookmarked passages get a light yellow highlight.
 
-## 運作原理
+## How it works
 
-- 資料存在 `chrome.storage.local`，每個對話一個 key：`conv:<對話 UUID>`，只留在本機。
-- 書籤用「角色 + 訊息開頭 200 字的指紋 + 訊息序號」定位，所以就算前面插入了新訊息也找得到；
-  段落書籤另外存引用文字，以忽略空白的方式比對。
-- 若訊息被編輯或切到其他分支，面板中該書籤會變淡，表示目前頁面找不到。
+- Data lives in `chrome.storage.local`, one key per conversation (`conv:<conversation UUID>`), and never leaves your machine. Each entry stores the bookmarks in display order plus the conversation's groups.
+- A bookmark is located by its role (you / Claude), a fingerprint of the message's first 200 characters, and its message index, so it still resolves after new messages are added earlier in the page. Passage bookmarks also store the quoted text and match it ignoring whitespace.
+- If a message has been edited or you switch to another branch of the conversation, its bookmark is dimmed in the panel to show it can't be found on the current page.
+- Dragging uses pointer events rather than HTML5 drag and drop, so it never triggers claude.ai's file-drop overlay.
 
-## claude.ai 改版時
+## When claude.ai changes its layout
 
-claude.ai 的 DOM 結構可能改變。Claude 回答會依序嘗試多個選擇器，
-全部失敗時會自動從對話結構推測（不含使用者訊息、也不是輸入框的對話回合就視為 Claude 回答），
-所以通常不需要手動修改。
+claude.ai's DOM may change over time. Claude's responses are detected by trying several selectors in order; if none match, the extension infers them from the conversation structure (any turn that contains no user message and isn't the input box is treated as a Claude response), so manual changes are usually unnecessary.
 
-如果 🔖 還是沒出現，打開 `content.js` 最上面的 `SEL_USER` / `SEL_ASSISTANT` 調整：
-用 DevTools 檢查使用者訊息與 Claude 回答的外層元素，換成新的 selector，
-再到 `chrome://extensions` 按重新載入即可。
+If the 🔖 button still doesn't appear, adjust `SEL_USER` / `SEL_ASSISTANT` at the top of `content.js`: inspect the outer elements of a user message and a Claude response in DevTools, update the selectors, then reload the extension in `chrome://extensions`.
