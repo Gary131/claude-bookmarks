@@ -1,4 +1,4 @@
-// Claude Conversation Bookmarks — popup / manager page
+// Conversation Bookmarks for Claude — popup / manager page
 const isPage = new URLSearchParams(location.search).has('page');
 if (isPage) document.body.classList.add('page');
 

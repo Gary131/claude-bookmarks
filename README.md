@@ -1,6 +1,8 @@
-# Claude Conversation Bookmarks (Chrome extension)
+# Conversation Bookmarks for Claude (Chrome extension)
 
 Bookmark messages or passages in claude.ai conversations, add notes, organize them into groups, and jump back to them quickly.
+
+> This is an independent project and is not affiliated with, endorsed by, or sponsored by Anthropic. “Claude” is a trademark of Anthropic, used here only to describe what the extension works with.
 
 ## Installation
 

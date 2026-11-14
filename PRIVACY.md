@@ -1,8 +1,8 @@
-# Privacy Policy — Claude Conversation Bookmarks
+# Privacy Policy — Conversation Bookmarks for Claude
 
 _Last updated: November 14, 2026_
 
-Claude Conversation Bookmarks ("the extension") lets you bookmark messages and passages in your claude.ai conversations and jump back to them. This policy explains what data the extension handles and how.
+Conversation Bookmarks for Claude ("the extension") lets you bookmark messages and passages in your claude.ai conversations and jump back to them. This policy explains what data the extension handles and how.
 
 The extension is an independent project and is not affiliated with, endorsed by, or sponsored by Anthropic.
 

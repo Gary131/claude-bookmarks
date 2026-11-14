@@ -1,4 +1,4 @@
-// Claude Conversation Bookmarks — content script (injected into claude.ai)
+// Conversation Bookmarks for Claude — content script (injected into claude.ai)
 (() => {
   'use strict';
   if (window.__cbmLoaded) return;
